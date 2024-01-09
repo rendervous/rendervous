@@ -1,0 +1,1 @@
+#define SUPPORTED_FLOAT_ATOM_ADD
