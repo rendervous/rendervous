@@ -1,13 +1,12 @@
-from .rendering import Layout, lazy_constant, tensor, tensor_copy, \
-    object_buffer, ObjectBufferAccessor, pipeline_compute, pipeline_raytracing, \
-    compute_manager, graphics_manager, raytracing_manager, submit, wrap, GPUPtr, BufferUsage, MemoryLocation
+from .rendering import Layout, lazy_constant, tensor, object_buffer, ObjectBufferAccessor, pipeline_compute, \
+    compute_manager, submit, wrap_gpu, BufferUsage, MemoryLocation
 from ._internal import device, get_seeds, __INCLUDE_PATH__
-from ._functions import random_sphere_points, random_ids
-from ._gmath import *
-from typing import List, Tuple, Optional, Literal, Union
+from ._functions import random_ids
+from rendervous.rendering._gmath import *
+from typing import List, Tuple, Optional, Literal, Union, Callable
 import torch
 import os
-from ._gmath import vec2, vec3, ivec3, ivec2
+from rendervous.rendering._gmath import vec2, vec3
 import numpy as np
 import threading
 
@@ -30,10 +29,9 @@ def torch_fallback(enable=True):
 
 class DispatcherEngine:
     __REGISTERED_MAPS__ = []  # Each map type
-    __REGISTERED_RAYCASTERS__ = []  # Each raycaster type  (FUTURE)
     __MAP_INSTANCES__ = {}  # All instances, from tuple with signature to codename.
+    __MAP_BY_SIGNATURE__ = { } # All different-signature maps grouped by parameter signature
     # __RAYCASTER_INSTANCES__ = { }  # All instances, from tuple with signature to codename.
-    __RT_SUPER_KERNEL__ = ""  # Current engine code
     __CS_SUPER_KERNEL__ = ""  # Current engine code
     __INCLUDE_DIRS__ = []
     __DEFINED_STRUCTS__ = {}
@@ -57,6 +55,10 @@ class DispatcherEngine:
     def start(cls):
         _, inner_structs, _ = cls.create_code_for_struct_declaration(ParameterDescriptor)
         cls.__DEFINED_STRUCTS__.update(inner_structs)
+        _, inner_structs, _ = cls.create_code_for_struct_declaration(MeshInfo)
+        cls.__DEFINED_STRUCTS__.update(inner_structs)
+        _, inner_structs, _ = cls.create_code_for_struct_declaration(RaycastableInfo)
+        cls.__DEFINED_STRUCTS__.update(inner_structs)
 
     @classmethod
     def register_map(cls, map_type: 'MapMeta') -> int:
@@ -77,6 +79,7 @@ class DispatcherEngine:
                        float: 'float',
                        torch.int32: 'int',
                        torch.float32: 'float',
+                       torch.int64: 'GPUPtr'
                    }[type_definition], {}, []
         if isinstance(type_definition, list):
             size = type_definition[0]
@@ -84,17 +87,17 @@ class DispatcherEngine:
             element_decl, inner_structures, element_sizes = cls.create_code_for_struct_declaration(t)
             return element_decl, inner_structures, [size] + element_sizes
         if isinstance(type_definition, dict):
-            assert 'name' in type_definition, 'Basic structs must be named, include a key name: str'
+            assert '__name__' in type_definition, 'Basic structs must be named, include a key name: str'
             inner_structures = {}
-            struct_code = f"struct {type_definition['name']} {{"
+            struct_code = f"struct {type_definition['__name__']} {{"
             for field_id, field_type in type_definition.items():
-                if field_id != 'name':
+                if field_id != '__name__':
                     t, field_inner_structures, sizes = cls.create_code_for_struct_declaration(field_type)
                     struct_code += t + " " + field_id + ''.join(f"[{size}]" for size in sizes) + '; \n'
                     inner_structures.update(field_inner_structures)
             struct_code += '};'
-            inner_structures[type_definition['name']] = struct_code
-            return type_definition['name'], inner_structures, []
+            inner_structures[type_definition['__name__']] = struct_code
+            return type_definition['__name__'], inner_structures, []
         return type_definition.__name__, {}, []  # vec and mats
 
     @classmethod
@@ -110,27 +113,28 @@ class DispatcherEngine:
                        float: 'float',
                        torch.int32: 'int',
                        torch.float32: 'float',
+                       torch.int64: 'GPUPtr'
                    }[type_definition], {}, []
         if isinstance(type_definition, list):
             size = type_definition[0]
             t = type_definition[1]
             field_value: ObjectBufferAccessor
-            element_decl, inner_structures, element_sizes = cls.create_code_for_map_declaration(t, field_value[0])
+            element_decl, inner_structures, element_sizes = cls.create_code_for_map_declaration(t, field_value[0] if len(field_value) > 0 else None)
             return element_decl, inner_structures, [size] + element_sizes
         if isinstance(type_definition, dict):
             inner_structures = {}
-            if 'name' in type_definition:  # external struct
-                struct_code = f"struct {type_definition['name']} {{"
+            if '__name__' in type_definition:  # external struct
+                struct_code = f"struct {type_definition['__name__']} {{"
                 for field_id, field_type in type_definition.items():
-                    if field_id != 'name':
+                    if field_id != '__name__':
                         t, field_inner_structures, sizes = cls.create_code_for_map_declaration(field_type,
                                                                                                getattr(field_value,
                                                                                                        field_id))
                         struct_code += t + " " + field_id + ''.join(f"[{size}]" for size in sizes) + '; \n'
                         inner_structures.update(field_inner_structures)
                 struct_code += '};'
-                inner_structures[type_definition['name']] = struct_code
-                return type_definition['name'], inner_structures, []
+                inner_structures[type_definition['__name__']] = struct_code
+                return type_definition['__name__'], inner_structures, []
             else:  # block
                 assert allow_block, 'Can not create a nested block. Add a name attribute to the dictionary to make it a struct'
                 code = "{"
@@ -138,17 +142,67 @@ class DispatcherEngine:
                     t, field_inner_structures, sizes = cls.create_code_for_map_declaration(field_type,
                                                                                            getattr(field_value,
                                                                                                    field_id))
-                    code += t + " " + field_id + ''.join(f"[{size}]" for size in sizes) + '; \n'
+                    code += t + " " + field_id + ''.join(f"[{size if size > 0 else ''}]" for size in sizes) + '; \n'
                     inner_structures.update(field_inner_structures)
                 code += '}'
                 return code, inner_structures, []
         return type_definition.__name__, {}, []  # vec and mats
 
     @classmethod
-    def append_map_instance_source_code(cls, map: 'MapBase', codename: str):
+    def create_prototype_for_dynamic_map(cls, map: 'MapMeta'):
+        input_dim = map.default_generics['INPUT_DIM']
+        output_dim = map.default_generics['OUTPUT_DIM']
+        return f"""
+void dynamic_forward (GPUPtr dynamic_map, in float _input[{input_dim}], out float _output[{output_dim}]);
+void dynamic_backward (GPUPtr dynamic_map, in float _input[{input_dim}], in float _output_grad[{output_dim}], out float _input_grad[{input_dim}]);
+        """
+
+    @classmethod
+    def create_code_for_dynamic_map(cls, input_dim, output_dim):
+        fw_cases = ""
+        bw_cases = ""
+        sig = (input_dim, output_dim)
+        if sig in cls.__MAP_BY_SIGNATURE__:
+            for (id, code_name) in cls.__MAP_BY_SIGNATURE__[sig]:
+                fw_cases += f"""
+                case {id}: forward({code_name}(buffer_{code_name}(dynamic_map)), _input, _output); break;
+                """
+                bw_cases += f"""
+                case {id}: backward({code_name}(buffer_{code_name}(dynamic_map)), _input, _output_grad, _input_grad); break;
+                """
+        return f"""
+void dynamic_forward (map_object, GPUPtr dynamic_map, in float _input[{input_dim}], out float _output[{output_dim}]) {{
+    [[unroll]] for (int i=0; i<{output_dim}; i++) _output[i] = 0.0;//((i^13+15 + int(random()*17))%{output_dim})/float({output_dim});
+    if (dynamic_map == 0) {{
+        return;
+    }}
+    int map_id = int_ptr(dynamic_map).data[0];
+    switch(map_id)
+    {{
+    {fw_cases}
+    }}  
+}}
+
+void dynamic_backward(map_object, GPUPtr dynamic_map, in float _input[{input_dim}], in float _output_grad[{output_dim}], out float _input_grad[{input_dim}])  {{
+    if (dynamic_map == 0) {{
+        [[unroll]] for (int i=0; i<{input_dim}; i++) _input_grad[i] = 0.0;
+        return;
+    }}
+    int map_id = int_ptr(dynamic_map).data[0];
+    switch(map_id)
+    {{
+    {bw_cases}
+    }}  
+}}
+
+    
+        """
+
+    @classmethod
+    def append_map_instance_source_code(cls, map: 'MapBase', instance_id: int, codename: str):
         code = ""
         map_object_parameters_code, external_structs, _ = cls.create_code_for_map_declaration(map.map_object_definition,
-                                                                                              map._rdv_map_buffer_accessor,
+                                                                                              map._rdv_accessor,
                                                                                               allow_block=True)
         for struct_name, struct_code in external_structs.items():
             if struct_name in cls.__DEFINED_STRUCTS__:
@@ -159,7 +213,7 @@ class DispatcherEngine:
                 cls.__DEFINED_STRUCTS__[struct_name] = struct_code
         # Add buffer_reference definition with codename and map object layout
         code += f"""
-layout(buffer_reference, scalar, buffer_reference_align=4) buffer buffer_{codename} {map_object_parameters_code};
+layout(buffer_reference, scalar, buffer_reference_align=8) buffer buffer_{codename} {map_object_parameters_code};
 struct {codename} {{ buffer_{codename} data; }};
 """
         for g, v in map.generics.items():
@@ -167,7 +221,13 @@ struct {codename} {{ buffer_{codename} data; }};
         code += f"#define map_object in {codename} object \n"
         code += f"#define parameters object.data \n"
 
+        for s in map.dynamic_requires:  # Generate dynamic access code for all required signatures
+            code += cls.create_code_for_dynamic_map(*s)
+
         code += map.map_source_code + "\n"
+        if (map.input_dim, map.output_dim) not in cls.__MAP_BY_SIGNATURE__:
+            cls.__MAP_BY_SIGNATURE__[(map.input_dim, map.output_dim)] = []
+        cls.__MAP_BY_SIGNATURE__[(map.input_dim, map.output_dim)].append((instance_id, codename))
 
         if map.non_differentiable:
             code += """
@@ -186,26 +246,18 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
         for g in map.generics:
             code += f"#undef {g}\n"
 
-        cls.__RT_SUPER_KERNEL__ += code
-        if not map.requires_raytracing:
-            cls.__CS_SUPER_KERNEL__ += code
         cls.__INCLUDE_DIRS__.extend(map.include_dirs)
+        return code
 
     @classmethod
     def register_instance(cls, map: 'MapBase') -> Tuple[int, str]:  # new or existing instance id for the object
         signature = map.signature
         if signature not in cls.__MAP_INSTANCES__:
             instance_id = len(cls.__MAP_INSTANCES__) + 1
-            codename = 'rdv_map_' + str(instance_id)
-            cls.append_map_instance_source_code(map, codename)
+            codename = f'{type(map).__name__}_{instance_id}' # 'rdv_map_' + str(instance_id)
+            cls.__CS_SUPER_KERNEL__ += cls.append_map_instance_source_code(map, instance_id, codename)
             cls.__MAP_INSTANCES__[signature] = (instance_id, codename)
         return cls.__MAP_INSTANCES__[signature]
-
-    @classmethod
-    def register_raycaster(cls, raycaster: 'RaycasterMeta') -> int:
-        code = len(cls.__REGISTERED_RAYCASTERS__)
-        cls.__REGISTERED_RAYCASTERS__.append(raycaster)
-        return code
 
     @classmethod
     def ensure_engine_objects(cls):
@@ -218,7 +270,8 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                 output=torch.int64,
                                                                                 seeds=ivec4,
                                                                                 start_index=int,
-                                                                                total_threads=int
+                                                                                total_threads=int,
+                                                                                debug_ptr=torch.int64
                                                                                 ))
 
         map_bw_eval = object_buffer(element_description=Layout.create_structure('std430',
@@ -227,7 +280,8 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                 output_grad=torch.int64,
                                                                                 seeds=ivec4,
                                                                                 start_index=int,
-                                                                                total_threads=int
+                                                                                total_threads=int,
+                                                                                debug_ptr=torch.int64
                                                                                 ))
 
         capture_fw_eval = object_buffer(element_description=Layout.create_structure('std430',
@@ -240,6 +294,7 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                     start_index=int,
                                                                                     total_threads=int,
                                                                                     samples=int,
+                                                                                    debug_ptr=torch.int64
                                                                                     ))
 
         capture_bw_eval = object_buffer(element_description=Layout.create_structure('std430',
@@ -252,6 +307,7 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                     start_index=int,
                                                                                     total_threads=int,
                                                                                     samples=int,
+                                                                                    debug_ptr=torch.int64
                                                                                     ))
         cls.__ENGINE_OBJECTS__ = {
             'map_fw_eval': map_fw_eval,
@@ -271,8 +327,12 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
         full_code = """
 #version 460
 #extension GL_GOOGLE_include_directive : require
+
 #include "common.h"
+
 layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+int DEBUG_COUNTER = 0;
 
         """ + cls.__CS_SUPER_KERNEL__ + f"""
 
@@ -283,6 +343,7 @@ layout(set = 0, std430, binding = 0) uniform RayGenMainDispatching {{
     uvec4 seeds; // seeds for the batch randoms
     int start_index;
     int total_threads;
+    GPUPtr debug_tensor_ptr;
 }};        
 
 layout(buffer_reference, scalar, buffer_reference_align=4) buffer rdv_input_data {{ float data [{map.input_dim}]; }};
@@ -304,6 +365,12 @@ void main()
     rdv_input_data input_buf = rdv_input_data(input_tensor_ptr + index * input_dim * 4);
     rdv_output_data output_buf = rdv_output_data(output_tensor_ptr + index * output_dim * 4);
     forward(main_map, input_buf.data, output_buf.data);
+    
+    if (debug_tensor_ptr != 0)
+    {{
+        int_ptr d_buf = int_ptr(debug_tensor_ptr);
+        d_buf.data[index] = DEBUG_COUNTER;
+    }}
 }}
         """
 
@@ -331,6 +398,8 @@ void main()
     #extension GL_GOOGLE_include_directive : require
     #include "common.h"
     layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+    
+    int DEBUG_COUNTER = 0;
 
             """ + cls.__CS_SUPER_KERNEL__ + f"""
 
@@ -341,6 +410,7 @@ void main()
         uvec4 seeds; // seeds for the batch randoms
         int start_index;
         int total_threads;
+        GPUPtr debug_tensor_ptr;
     }};        
 
     layout(buffer_reference, scalar, buffer_reference_align=4) buffer rdv_input_data {{ float data [{map.input_dim}]; }};
@@ -362,6 +432,12 @@ void main()
         rdv_input_data input_buf = rdv_input_data(input_tensor_ptr + index * input_dim * 4);
         rdv_output_data output_grad_buf = rdv_output_data(output_tensor_grad_ptr + index * output_dim * 4);
         backward(main_map, input_buf.data, output_grad_buf.data);
+        
+        if (debug_tensor_ptr != 0)
+        {{
+            int_ptr d_buf = int_ptr(debug_tensor_ptr);
+            d_buf.data[index] = DEBUG_COUNTER;
+        }}
     }}
             """
 
@@ -390,6 +466,8 @@ void main()
         #extension GL_GOOGLE_include_directive : require
         #include "common.h"
         layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+        
+        int DEBUG_COUNTER = 0;
 
                 """ + cls.__CS_SUPER_KERNEL__ + f"""
 
@@ -403,6 +481,7 @@ void main()
             int start_index;
             int total_threads;
             int samples;
+            GPUPtr debug_tensor_ptr;
         }};        
 
         layout(buffer_reference, scalar, buffer_reference_align=4) buffer rdv_output_data {{ float data [{field.output_dim}]; }};
@@ -412,16 +491,18 @@ void main()
             int index = int(gl_GlobalInvocationID.x) + start_index;
             if (index >= total_threads) return;
 
-            uvec4 current_seeds = seeds + uvec4(0x23F1,0x3137,129,index + 129) ;//^ uvec4(int(cos(index)*1000000), index ^ 1231231, index + 1234122, index + seeds.w * 100202021);//seeds ^ uvec4(index ^ 17, index * 123111171, index + 11, index ^ (seeds.x + 13 * seeds.y));
+            uvec4 current_seeds = seeds + uvec4(0x23F1+index,0x3137+(index+14)*index*17923113,129*index,index + 129) ;//^ uvec4(int(cos(index)*1000000), index ^ 1231231, index + 1234122, index + seeds.w * 100202021);//seeds ^ uvec4(index ^ 17, index * 123111171, index + 11, index ^ (seeds.x + 13 * seeds.y));
 
             //uvec4 current_seeds = seeds ^ uvec4(index * 78182311, index ^ 1231231, index + 1234122, index + seeds.w * 100202021);//seeds ^ uvec4(index ^ 17, index * 123111171, index + 11, index ^ (seeds.x + 13 * seeds.y));
             set_seed(current_seeds);
             advance_random();
             advance_random();
-            advance_random();
-            advance_random();
             uvec4 new_seed = floatBitsToUint(vec4(random(), random(), random(), random()));
             set_seed(new_seed);
+            advance_random();
+            advance_random();
+            advance_random();
+            advance_random();
 
             float indices[{capture_object.input_dim}];
 
@@ -471,6 +552,12 @@ void main()
                 for (int i=0; i<output_dim; i++)
                     output_buf.data[i] /= samples;
             }}
+            
+            if (debug_tensor_ptr != 0)
+            {{
+                int_ptr d_buf = int_ptr(debug_tensor_ptr);
+                d_buf.data[index] = DEBUG_COUNTER;
+            }}
         }}
                 """
 
@@ -499,6 +586,8 @@ void main()
         #extension GL_GOOGLE_include_directive : require
         #include "common.h"
         layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+        
+        int DEBUG_COUNTER = 0;
 
                 """ + cls.__CS_SUPER_KERNEL__ + f"""
 
@@ -512,6 +601,7 @@ void main()
             int start_index;
             int total_threads;
             int samples;
+            GPUPtr debug_tensor_ptr;
         }};        
 
         layout(buffer_reference, scalar, buffer_reference_align=4) buffer rdv_output_data {{ float data [{field.output_dim}]; }};
@@ -568,6 +658,12 @@ void main()
                 backward(main_map, sensor_position, output_grad, dL_dp);
             }}
             backward(capture_object, indices, dL_dp); // TODO: Check ways to update sensor parameters from ray differentials
+            
+            if (debug_tensor_ptr != 0)
+            {{
+                int_ptr d_buf = int_ptr(debug_tensor_ptr);
+                d_buf.data[index] = DEBUG_COUNTER;
+            }}
         }}
                 """
 
@@ -585,12 +681,14 @@ void main()
     @classmethod
     def eval_capture_forward(cls, capture_object: 'SensorsBase', field: 'MapBase',
                              sensors: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
-                             fw_samples: int = 1) -> torch.Tensor:
+                             fw_samples: int = 1, debug_out: Optional[torch.Tensor] = None) -> torch.Tensor:
         if sensors is not None:
             total_threads = sensors.numel() // sensors.shape[-1]
         else:
             total_threads = math.prod(capture_object.index_shape[
                                       :capture_object.input_dim]).item()  # capture_object.screen_width * capture_object.screen_height
+
+        assert debug_out is None or debug_out.numel() == total_threads, f"Debug tensor provided has not the required size {total_threads}"
 
         if batch_size is None:
             batch_size = total_threads
@@ -618,12 +716,12 @@ void main()
         capture_object._pre_eval(False)
         field._pre_eval(False)
 
-        output_ptr = wrap(output, 'out')
+        output_ptr = wrap_gpu(output, 'out')
 
         with cls.__ENGINE_OBJECTS__['capture_fw_eval'] as b:
-            b.capture_sensor = wrap(capture_object)
-            b.main_map = wrap(field)
-            b.sensors = wrap(sensors)
+            b.capture_sensor = wrap_gpu(capture_object)
+            b.main_map = wrap_gpu(field)
+            b.sensors = wrap_gpu(sensors)
             b.tensor = output_ptr
             b.seeds[:] = get_seeds()
             shape = b.sensor_shape
@@ -634,6 +732,7 @@ void main()
             b.start_index = 0
             b.total_threads = total_threads
             b.samples = fw_samples
+            b.debug_ptr = 0 if debug_out is None else wrap_gpu(debug_out, 'out')
 
         for batch in range((total_threads + batch_size - 1) // batch_size):
             with cls.__ENGINE_OBJECTS__['capture_fw_eval'] as b:
@@ -683,10 +782,10 @@ void main()
             field._pre_eval(True)
 
             with cls.__ENGINE_OBJECTS__['capture_bw_eval'] as b:
-                b.capture_sensor = wrap(capture_object)
-                b.main_map = wrap(field)
-                b.sensors = wrap(sensors)
-                b.tensor_grad = wrap(output_grad)
+                b.capture_sensor = wrap_gpu(capture_object)
+                b.main_map = wrap_gpu(field)
+                b.sensors = wrap_gpu(sensors)
+                b.tensor_grad = wrap_gpu(output_grad)
                 b.seeds[:] = get_seeds()
                 shape = b.sensor_shape
                 shape[0] = capture_object.index_shape[0].item()
@@ -729,9 +828,9 @@ void main()
         map_object._pre_eval(False)
 
         with cls.__ENGINE_OBJECTS__['map_fw_eval'] as b:
-            b.main_map = wrap(map_object)
-            b.input = wrap(input)
-            b.output = wrap(output, 'out')
+            b.main_map = wrap_gpu(map_object)
+            b.input = wrap_gpu(input)
+            b.output = wrap_gpu(output, 'out')
             b.seeds[:] = get_seeds()
             b.start_index = 0
             b.total_threads = total_threads
@@ -768,9 +867,9 @@ void main()
             map_object._pre_eval(True)
 
             with cls.__ENGINE_OBJECTS__['map_bw_eval'] as b:
-                b.main_map = wrap(map_object)
-                b.input = wrap(input)
-                b.output_grad = wrap(output_grad)
+                b.main_map = wrap_gpu(map_object)
+                b.input = wrap_gpu(input)
+                b.output_grad = wrap_gpu(output_grad)
                 b.seeds[:] = get_seeds()
                 b.start_index = 0
                 b.total_threads = total_threads
@@ -786,8 +885,18 @@ def start_engine():
     DispatcherEngine.start()
 
 
-ParameterDescriptor = dict(
-    name='Parameter',
+def map_struct(
+        struct_name: str,
+        **fields
+):
+    return dict(
+        __name__ = struct_name,
+        **fields
+    )
+
+
+ParameterDescriptor = map_struct(
+    'Parameter',
     data=torch.Tensor,
     stride=[4, int],
     shape=[4, int],
@@ -795,25 +904,73 @@ ParameterDescriptor = dict(
 )
 
 
-def parameter(p: Union[torch.Tensor, torch.nn.Parameter]):
+ParameterDescriptorLayoutType = dict(
+    __name__='Parameter',
+    data=torch.int64,
+    stride=[4, int],
+    shape=[4, int],
+    grad_data=torch.int64
+)
+
+
+
+MeshInfo = map_struct(
+    'MeshInfo',
+    positions=ParameterDescriptor,
+    normals=ParameterDescriptor,
+    coordinates=ParameterDescriptor,
+    tangents=ParameterDescriptor,
+    binormals=ParameterDescriptor,
+    indices=ParameterDescriptor
+)
+
+
+RaycastableInfo = map_struct(
+    'RaycastableInfo',
+    callable_map=torch.int64,
+    explicit_info=torch.int64,
+)
+
+
+def parameter(p: Union[None, torch.Tensor, torch.nn.Parameter]):
+    if p is None:
+        return None
     if isinstance(p, torch.nn.Parameter):
         return p
     return torch.nn.Parameter(p, requires_grad=p.requires_grad)
 
 
 def bind_parameter(field: ObjectBufferAccessor, t: torch.Tensor):
-    field.data = wrap(t, 'in')
-    for i, s in enumerate(t.shape):
-        field.stride[i] = t.stride(i)
-        field.shape[i] = s
+    field.data = wrap_gpu(t, 'in')
+    if t is not None:
+        for i, s in enumerate(t.shape):
+            field.stride[i] = t.stride(i)
+            field.shape[i] = s
 
 
 def bind_parameter_grad(field: ObjectBufferAccessor):
+    if field.data.obj is None:
+        return
     t: torch.Tensor = field.data.obj
     if t.requires_grad:
         if t.grad is None:
             t.grad = tensor(*t.shape, dtype=t.dtype).zero_()
-        field.grad_data = wrap(t.grad, 'inout')
+        field.grad_data = wrap_gpu(t.grad, 'inout')
+
+
+class TensorCheck(object):
+    def __init__(self, initial_value: Optional[torch.Tensor] = None):
+        self.cached_tensor = initial_value
+        self.cached_tensor_version = -1 if initial_value is None else initial_value._version
+
+    def changed(self, t: torch.Tensor):
+        if not (t is self.cached_tensor):
+            self.cached_tensor = t
+            return True
+        if t._version != self.cached_tensor_version:
+            self.cached_tensor_version = t._version
+            return True
+        return False
 
 
 class MapMeta(type):
@@ -825,8 +982,10 @@ class MapMeta(type):
             extension_path = extension_info.get('path', None)
             extension_code = extension_info.get('code', None)
             extension_generics = extension_info.get('generics', {})
-            assert extension_path is None or isinstance(extension_path, str) and os.path.isfile(
-                extension_path), 'path must be a valid file path str'
+            extension_dynamic_requires = extension_info.get('dynamics', [])  # List with list of map signatures that can be dispatched dynamically by this map
+            parameters = extension_info.get('parameters', {})
+            assert (extension_path is None or isinstance(extension_path, str) and os.path.isfile(
+                extension_path)), 'path must be a valid file path str'
             include_dirs = extension_info.get('include_dirs', [])
             assert (extension_path is None) != (extension_code is None), 'Either path or code must be provided'
             if extension_path is not None:
@@ -834,60 +993,119 @@ class MapMeta(type):
                 extension_code = f"#include \"{os.path.basename(extension_path)}\"\n"
                 # with open(extension_path) as f:
                 #     extension_code = f.readlines()
-            parameters = extension_info.get('parameters', {})
-            if parameters is None or len(parameters) == 0:
-                parameters = dict(foo=int)
             non_differentiable = extension_info.get('nodiff', False)
-            use_raycast = extension_info.get('use_raycast', False)
 
-            def from_type_2_layout_description(p):
+            def from_type_2_layout_description(p, dynamic_array_size = 0):
                 if p == MapBase:
                     return torch.int64
                 if p == torch.Tensor:
                     return torch.int64
                 if isinstance(p, list):
-                    return [p[0], from_type_2_layout_description(p[1])]
+                    return [p[0] if p[0] > 0 else dynamic_array_size, from_type_2_layout_description(p[1])]
                 if isinstance(p, dict):
-                    return {k: from_type_2_layout_description(v) for k, v in p.items() if k != 'name'}
+                    return {'__name__': p.get('__name__'), ** {k: from_type_2_layout_description(v, dynamic_array_size) for k, v in p.items() if k != '__name__'}}
                 return p
 
-            parameters_layout = Layout.create(from_type_2_layout_description(parameters), mode='scalar')
+            parameters = {'rdv_map_id': int, 'rdv_map_pad0': int, **parameters}
+            parameters_layout = lambda s: Layout.create(from_type_2_layout_description(parameters, s), mode='scalar')
             ext_class.default_generics = extension_generics
+            ext_class.dynamic_requires = extension_dynamic_requires
             ext_class.map_object_layout = parameters_layout
             ext_class.map_object_definition = parameters
             ext_class.map_source_code = extension_code
             ext_class.non_differentiable = non_differentiable
-            ext_class.use_raycast = use_raycast
+            ext_class.use_raycast = False  # TODO: Remove this.
             ext_class.include_dirs = include_dirs
             ext_class.map_code = DispatcherEngine.register_map(ext_class)
         return ext_class
 
     def __call__(self, *args, **kwargs):
         map_instance: MapBase = super(MapMeta, self).__call__(*args, **kwargs)
-        map_instance._freeze_submodules()
+        map_instance._create_signature()
         map_id, map_codename = DispatcherEngine.register_instance(map_instance)
-        object.__setattr__(map_instance, 'map_id', map_id)
+        map_instance.rdv_map_id = map_id
         return map_instance
 
 
-class MapBase(torch.nn.Module, metaclass=MapMeta):
+class GPUDirectModule(torch.nn.Module):
+    def __init__(self, accessor: ObjectBufferAccessor):
+        assert accessor._rdv_layout.is_structure
+        super().__init__()
+        # object used to access attributes from the Module directly to the gpu
+        object.__setattr__(self, '_rdv_accessor', accessor)
+        for k, (offset, field_type) in accessor._rdv_layout.fields_layout.items():
+            if field_type.is_array:  # lists
+                object.__setattr__(self, k, getattr(accessor, k))
+            if field_type.is_structure:
+                # Wrap field structures with a struct module
+                super().__setattr__(k, StructModule(getattr(accessor, k)))
+
+    def __setattr__(self, key, value):
+        a: ObjectBufferAccessor = self._rdv_accessor
+        # Update gpu info if field is part of the accessed object
+        if key in a._rdv_fields:
+            field_layout = a._rdv_layout.fields_layout[key][1]
+            if field_layout.scalar_format == 'Q':
+                if isinstance(value, int):
+                    setattr(a, key, value)
+                else:
+                    setattr(a, key, wrap_gpu(value))
+            elif field_layout.is_structure and field_layout.declaration['__name__'] == ParameterDescriptor['__name__']: # key in self._parameters or isinstance(value, torch.nn.Parameter):
+                bind_parameter(getattr(a, key), value)
+            else:
+                setattr(a, key, value)
+        super().__setattr__(key, value)
+
+    def _pre_eval(self, include_grads: bool = False):
+        if include_grads:
+            for k,v in self._parameters.items():
+                if v.requires_grad:
+                    bind_parameter_grad(getattr(self._rdv_accessor, k))
+        def deep_pre_eval(m: Union[torch.nn.Module]):
+            if isinstance(m, GPUDirectModule):
+                m._pre_eval(include_grads)
+            if isinstance(m, torch.nn.ModuleList):
+                for c in m:
+                    deep_pre_eval(c)
+        for k, m in self._modules.items():
+            deep_pre_eval(m)
+        # iterate over all potential wrapped objects that needs to update their info on the gpu
+        for r in self._rdv_accessor.references():
+            if r is not None:
+                r.flush()
+
+    def _pos_eval(self, include_grads: bool = False):
+        def deep_pos_eval(m: Union[torch.nn.Module]):
+            if isinstance(m, GPUDirectModule):
+                m._pos_eval(include_grads)
+            if isinstance(m, torch.nn.ModuleList):
+                for c in m:
+                    deep_pos_eval(c)
+        for k, m in self._modules.items():
+            deep_pos_eval(m)
+        # iterate over all potential wrapped objects that needs to update their info from the gpu
+        for r in self._rdv_accessor.references():
+            if r is not None:
+                r.mark_as_dirty()
+                r.invalidate()
+
+
+class MapBase(GPUDirectModule, metaclass=MapMeta):
     __extension_info__ = None  # none extension info marks the node as abstract
     __bindable__ = None
-    map_object_layout: Layout = None
+    map_object_layout: Callable[[int], Layout] = None
 
-    def __init__(self, **generics):
-        map_buffer = object_buffer(element_description=self.map_object_layout, usage=BufferUsage.STAGING,
+    def __init__(self, *args, **generics):
+        array_size = 0 if len(args) == 0 else args[0]
+        instance_layout = type(self).map_object_layout(array_size)
+        map_buffer = object_buffer(element_description=instance_layout, usage=BufferUsage.STORAGE,
                                    memory=MemoryLocation.CPU)
         object.__setattr__(self, '__bindable__', map_buffer)
         object.__setattr__(self, '_rdv_map_buffer', map_buffer)
-        object.__setattr__(self, '_rdv_map_buffer_accessor', map_buffer.accessor)
         object.__setattr__(self, '_rdv_trigger_bw', torch.tensor([0.0], requires_grad=True))
         object.__setattr__(self, '_rdv_no_trigger_bw', torch.tensor([0.0], requires_grad=False))
         object.__setattr__(self, 'generics', {**self.default_generics, **generics})
-        for k, (offset, field_type) in self.map_object_layout.fields_layout.items():
-            if field_type.is_array:  # lists
-                object.__setattr__(self, k, getattr(map_buffer.accessor, k))
-        super(MapBase, self).__init__()
+        super().__init__(map_buffer.accessor)
 
     @lazy_constant
     def input_dim(self):
@@ -903,25 +1121,7 @@ class MapBase(torch.nn.Module, metaclass=MapMeta):
     def support_maximum_query(self) -> bool:
         return False
 
-    # def __getattr__(self, item):
-    #     a : ObjectBufferAccessor = object.__getattribute__(self, '_rdv_map_buffer_accessor')
-    #     if item in a._rdv_fields:
-    #         return getattr(a, item)
-    #     return super(MapBase, self).__getattr__(item)
-
-    def __setattr__(self, key, value):
-        a: ObjectBufferAccessor = self._rdv_map_buffer_accessor
-        if key in a._rdv_fields:
-            if a._rdv_layout.fields_layout[key][1].scalar_format == 'Q':
-                setattr(a, key, wrap(value))
-            elif key in self._parameters or isinstance(value, torch.nn.Parameter):
-                bind_parameter(getattr(a, key), value)
-            else:
-                setattr(a, key, value)
-        super(MapBase, self).__setattr__(key, value)
-
-    def _freeze_submodules(self):
-        requires_raytracing = self.use_raycast
+    def _create_signature(self):
         submodules = []
 
         def collect_submodules(field_name, t, v):
@@ -932,44 +1132,22 @@ class MapBase(torch.nn.Module, metaclass=MapMeta):
             if isinstance(t, list):
                 size = t[0]
                 element_type = t[1]
-                collect_submodules(field_name, element_type, v[
-                    0])  # only collect from zero index, TODO: CHECK all array derivations have the same signature!
+                if size > 0:
+                    collect_submodules(field_name, element_type, v[0])  # only collect from zero index, TODO: CHECK all array derivations have the same signature!
             if isinstance(t, dict):
                 for field_name, field_type in t.items():
-                    if field_name != 'name':
+                    if field_name != '__name__':
                         collect_submodules(field_name, field_type, getattr(v, field_name))
 
-        collect_submodules('', self.map_object_definition, self._rdv_map_buffer_accessor)
+        collect_submodules('', self.map_object_definition, self._rdv_accessor)
 
-        for sub_object in submodules:
-            requires_raytracing |= sub_object.requires_raytracing  # append if any use ray or random
-
-        object.__setattr__(self, 'requires_raytracing', requires_raytracing)
         object.__setattr__(self, 'signature', (
         self.map_code, *[0 if s is None else DispatcherEngine.register_instance(s)[0] for s in submodules],
         *[v for k, v in self.generics.items()]))
 
     def _pre_eval(self, include_grads: bool = False):
-        if include_grads:
-            for k,v in self._parameters.items():
-                if v.requires_grad:
-                    bind_parameter_grad(getattr(self._rdv_map_buffer_accessor, k))
-        for k, m in self._modules.items():
-            if isinstance(m, MapBase):
-                m._pre_eval(include_grads)
-        for r in self._rdv_map_buffer_accessor.references():
-            if r is not None:
-                r.flush()
+        super()._pre_eval(include_grads)
         self._rdv_map_buffer.update_gpu()
-
-    def _pos_eval(self, include_grads: bool = False):
-        for k, m in self._modules.items():
-            if isinstance(m, MapBase):
-                m._pos_eval(include_grads)
-        for r in self._rdv_map_buffer_accessor.references():
-            if r is not None:
-                r.mark_as_dirty()
-                r.invalidate()
 
     def forward_torch(self, *args):
         raise Exception(f"Not implemented torch engine in type {type(self)}")
@@ -1052,6 +1230,92 @@ class MapBase(torch.nn.Module, metaclass=MapMeta):
         return ConcatMap(self, other)
 
 
+class StructModule(GPUDirectModule):
+    def __init__(self, accessor: ObjectBufferAccessor):
+        super().__init__(accessor)
+
+
+class Sampler(MapBase):
+    """
+    Represents a distribution of x~q(x|C) by means of a map
+    C -> x, w(x) where x~p(x|C) and w(x) is a weighted sampled of x (q(x|C)/p(x|C)).
+    """
+    __extension_info__ = None  # Abstract Node
+
+    def get_pdf(self) -> 'MapBase':
+        '''
+        Gets the map that represents the pdf q(x|C)
+        '''
+        raise NotImplementedError()
+
+    @staticmethod
+    def mixture(alpha: MapBase, sampler_a: 'Sampler', sampler_b: 'Sampler') -> 'Sampler':
+        return MixtureSampler(alpha, sampler_a, sampler_b)
+
+    @staticmethod
+    def mis(self, *samplers):
+        pass
+
+
+class MixtureSampler(Sampler):
+    __extension_info__ = dict(
+        nodiff=True,
+        parameters=dict(
+            alpha=MapBase,
+            sampler_a=MapBase,
+            sampler_b=MapBase
+        ),
+        code=f"""
+FORWARD
+{{
+    float alpha[1];
+    forward(parameters.alpha, _input, alpha);
+    if (random() < alpha[0])    
+    {{
+        forward(parameters.sampler_a, _input, _output);
+    }}
+    else {{
+        forward(parameters.sampler_b, _input, _output);
+    }}
+}}
+        """
+    )
+
+    def __init__(self, alpha: MapBase, sampler_a: Sampler, sampler_b: Sampler):
+        super().__init__()
+        self.alpha = alpha
+        self.sampler_a = sampler_a
+        self.sampler_b = sampler_b
+
+    def get_pdf(self) -> 'MapBase':
+        return MixturePDF(self.alpha, self.sampler_a.get_pdf(), self.sampler_b.get_pdf())
+
+
+class MixturePDF(MapBase):
+    __extension_info__ = dict(
+        nodiff=True,
+        parameters=dict(
+            alpha=MapBase,
+            sampler_a_pdf=MapBase,
+            sampler_b_pdf=MapBase
+        ),
+        code=f"""
+FORWARD {{
+    float alpha[1];
+    float _condition[CONDITION_DIM];
+    [[unroll]] for (int i=0; i<CONDITION_DIM; i++)
+        _condition[i] = _input[i];
+    forward(parameters.alpha, _condition, alpha);
+    float _pdf_a[1];
+    forward(parameters.sampler_a_pdf, _input, _pdf_a);
+    float _pdf_b[1];
+    forward(parameters.sampler_b_pdf, _input, _pdf_b);
+    _output[0] = _pdf_a[0] * alpha[0] + _pdf_b[0] * (1 - alpha[0]);
+}}
+        """
+    )
+
+
 class AutogradMapFunction(torch.autograd.Function):
 
     @staticmethod
@@ -1074,13 +1338,13 @@ class AutogradCaptureFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *args):
-        sensors, triggering, batch_size, fw_samples, bw_samples, field, capture_object = args
+        sensors, triggering, batch_size, fw_samples, bw_samples, field, capture_object, debug_out = args
         ctx.field = field
         ctx.sensors = sensors
         ctx.capture_object = capture_object
         ctx.batch_size = batch_size
         ctx.bw_samples = bw_samples
-        return DispatcherEngine.eval_capture_forward(capture_object, field, sensors, batch_size, fw_samples)
+        return DispatcherEngine.eval_capture_forward(capture_object, field, sensors, batch_size, fw_samples, debug_out)
 
     @staticmethod
     def backward(ctx, *args):
@@ -1162,12 +1426,12 @@ class SensorsBase(MapBase):
         return output
 
     def capture(self, field: 'MapBase', sensors_batch: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
-                fw_samples: int = 1, bw_samples: int = 1):
+                fw_samples: int = 1, bw_samples: int = 1, debug_out: Optional[torch.Tensor] = None):
         if not __USE_VULKAN_DISPATCHER__:
             return self.capture_torch(field, sensors_batch, fw_samples)
         trigger_bw = self._rdv_trigger_bw if any(True for _ in self.parameters()) or any(
             True for _ in field.parameters()) else self._rdv_no_trigger_bw
-        return AutogradCaptureFunction.apply(sensors_batch, trigger_bw, batch_size, fw_samples, bw_samples, field, self)
+        return AutogradCaptureFunction.apply(sensors_batch, trigger_bw, batch_size, fw_samples, bw_samples, field, self, debug_out)
 
     def random_sensors(self, batch_size: int, out: Optional[torch.Tensor] = None) -> torch.Tensor:
         # if out is not None:
@@ -1410,7 +1674,7 @@ BACKWARD {
     )
 
     def __init__(self, input_dim: int, value: Union[torch.Tensor, torch.nn.Parameter]):
-        assert len(value.shape) == 1
+        assert len(value.shape) == 1 and value.dtype == torch.float
         super(ConstantMap, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=value.numel())
         self.value = parameter(value)
 
@@ -1488,6 +1752,34 @@ class IndexMap(MapBase):
         self.map = map
         for i in range(len(indices)):
             self.indices[i] = indices[i]
+
+
+class SelectMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            indices=[32, int]
+        ),
+        code="""
+        FORWARD {
+            float output_map[OUTPUT_DIM];
+            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _output[i] = _input[parameters.indices[i]];
+        }
+        BACKWARD {
+            [[unroll]] for (int i=0; i < INPUT_DIM; i++) _input_grad[i] = 0.0;
+            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _input_grad[parameters.indices[i]] = _output_grad[i];
+        }
+        """
+    )
+
+    def __init__(self, input_dim: int, indices: List[int]):
+        assert all(i >= 0 and i<input_dim for i in indices)
+        super(SelectMap, self).__init__(
+            INPUT_DIM=input_dim,
+            OUTPUT_DIM=len(indices)
+        )
+        for i in range(len(indices)):
+            self.indices[i] = indices[i]
+
 
 
 # Sensors
@@ -1906,6 +2198,33 @@ BACKWARD
 
     def support_maximum_query(self) -> bool:
         return True
+
+
+class Transformed3DMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            base_map=MapBase,
+            transform=mat4,
+            inverse_transform=mat4
+        ),
+        generics=dict(INPUT_DIM=3),
+        nodiff=True,
+        code = f"""
+    FORWARD {{
+        vec4 x = vec4(_input[0], _input[1], _input[2], 1.0);
+        x = parameters.inverse_transform * x;
+        x.xyz /= x.w;
+        forward(parameters.base_map, float[3](x.x, x.y, x.z), _output);
+    }}
+        """
+    )
+
+    def __init__(self, base_map: MapBase, transform: mat4 ):
+        assert base_map.input_dim == 3
+        super().__init__(OUTPUT_DIM=base_map.output_dim)
+        self.base_map = base_map
+        self.transform = transform
+        self.inverse_transform = mat4.inverse(transform)
 
 
 class XRProjection(MapBase):
@@ -4191,6 +4510,8 @@ def one(dim):
     raise NotImplementedError()
 
 def constant(input_dim, *args):
+    if len(args) == 1 and isinstance(args[0], torch.Tensor):
+        return ConstantMap(input_dim=input_dim, value=args[0])
     return ConstantMap(input_dim=input_dim, value=torch.tensor([*args], device=device(), dtype=torch.float))
 
 def ray_to_segment(distance_field: 'MapBase'):

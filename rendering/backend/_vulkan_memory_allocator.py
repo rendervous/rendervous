@@ -208,13 +208,25 @@ class VulkanMemoryPage:
                                             if os.name == 'nt'
                                             else VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
                                             )
-        self.full_block_info = VkBufferCreateInfo(pNext=external_info, flags=0, size=capacity,
-                                                     usage=VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR)
-        self.full_block = vkCreateBuffer(self.vk_device, self.full_block_info, None)
-        vkBindBufferMemory(self.vk_device, self.full_block, self.vk_memory, 0)
+        # temporal buffer to get the device address for the whole page
+        full_block_info = VkBufferCreateInfo(pNext=external_info, flags=0, size=capacity,
+                                                     usage=
+                                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                                     VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                                                     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR
+                                             )
+        full_block = vkCreateBuffer(self.vk_device, full_block_info, None)
+        vkBindBufferMemory(self.vk_device, full_block, self.vk_memory, 0)
         self.vkGetBufferDeviceAddressKHR = vkGetDeviceProcAddr(self.vk_device, "vkGetBufferDeviceAddressKHR")
-        self.buffer_info = VkBufferDeviceAddressInfo(buffer=self.full_block)
-        self.memory_device_ptr = self.vkGetBufferDeviceAddressKHR(self.vk_device, self.buffer_info)
+        buffer_info = VkBufferDeviceAddressInfo(buffer=full_block)
+        self.memory_device_ptr = self.vkGetBufferDeviceAddressKHR(self.vk_device, buffer_info)
+        # vkDestroyBuffer(self.vk_device, full_block, None)
+        self.full_block = full_block
+
         self.support_cuda = False
 
         # create a full tensor to map all memory in any case

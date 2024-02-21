@@ -1,11 +1,9 @@
 import typing
 
-import torch
-from typing import Optional, Dict, Tuple, Literal, Union, List, Any, Collection
+from typing import Optional, Dict, Tuple, Literal, Union, List
 from ._enums import Format
-from rendervous._gmath import *
+from rendervous.rendering._gmath import *
 import math
-import struct
 import numpy as np
 import ctypes
 
@@ -62,7 +60,9 @@ __DTYPE_TO_STR__ = {
 #         object.__setattr__(self, key, value)
 
 
-def freezable_type(t: type):
+__frozen_type_T = typing.TypeVar('FrozenType')
+
+def freezable_type(t: __frozen_type_T) -> __frozen_type_T:
     def new_call(cls, *args, **kwargs):
         instance = t(*args, **kwargs)
         instance._frozen = True
@@ -385,14 +385,17 @@ class Layout:
             offset = 0
             fields = dict()
             for f, field_type in type.items():
-                field_layout = Layout._build_layout_compact(field_type)
-                fields[f] = (offset, field_layout)
-                offset += field_layout.size
+                if f != '__name__':
+                    field_layout = Layout._build_layout_compact(field_type)
+                    fields[f] = (offset, field_layout)
+                    offset += field_layout.size
             return Layout._create_structure_layout(type, offset, 1, fields)
         raise Exception('Not supported type definition')
 
     @staticmethod
     def _build_layout_scalar(type):
+        if type == int or type == float:
+            return Layout._create_scalar_layout(type, 4, 4)
         if isinstance(type, typing.Hashable) and type in Layout.__TYPE_SIZES__:
             size = Layout.__TYPE_SIZES__[type]
             return Layout._create_scalar_layout(type, size, size)
@@ -404,7 +407,7 @@ class Layout:
             vector_layout = Layout._create_vector_layout(type, vec_size, component_size, element_layout)
             if type.dimension == 1:  # vector
                 return vector_layout
-            return Layout._create_matrix_layout(type, vec_size * type.tensor_shape[0], component_size, vector_layout, vec_size)
+            return Layout._create_matrix_layout(type, vec_size * type.tensor_shape[0], component_size, element_layout, vec_size)
         if isinstance(type, list):
             array_len = type[0]
             array_type = type[1]
@@ -419,17 +422,20 @@ class Layout:
             fields = dict()
             max_alignment = 1
             for f, field_type in type.items():
-                field_layout = Layout._build_layout_scalar(field_type)
-                field_alignment = field_layout.alignment
-                offset = Layout._align_size(offset, field_alignment)
-                max_alignment = max(max_alignment, field_alignment)
-                fields[f] = (offset, field_layout)
-                offset += field_layout.size
+                if f != '__name__':
+                    field_layout = Layout._build_layout_scalar(field_type)
+                    field_alignment = field_layout.alignment
+                    offset = Layout._align_size(offset, field_alignment)
+                    max_alignment = max(max_alignment, field_alignment)
+                    fields[f] = (offset, field_layout)
+                    offset += field_layout.size
             return Layout._create_structure_layout(type, offset, max_alignment, fields)
         raise Exception(f'Not supported type definition {type}')
 
     @staticmethod
     def _build_layout_std430(type):
+        if type == int or type == float:
+            return Layout._create_scalar_layout(type, 4, 4)
         if isinstance(type, typing.Hashable) and type in Layout.__TYPE_SIZES__:
             size = Layout.__TYPE_SIZES__[type]
             return Layout._create_scalar_layout(type, size, size)
@@ -460,12 +466,13 @@ class Layout:
             fields = dict()
             max_alignment = 1
             for f, field_type in type.items():
-                field_layout = Layout._build_layout_std430(field_type)
-                field_alignment = field_layout.alignment
-                offset = Layout._align_size(offset, field_alignment)
-                max_alignment = max(max_alignment, field_alignment)
-                fields[f] = (offset, field_layout)
-                offset += field_layout.size
+                if f != '__name__':
+                    field_layout = Layout._build_layout_std430(field_type)
+                    field_alignment = field_layout.alignment
+                    offset = Layout._align_size(offset, field_alignment)
+                    max_alignment = max(max_alignment, field_alignment)
+                    fields[f] = (offset, field_layout)
+                    offset += field_layout.size
             return Layout._create_structure_layout(type, offset, max_alignment, fields)
         raise Exception('Not supported type definition')
 
@@ -485,7 +492,8 @@ class Layout:
     def create_instance_layout():
         return Layout.create_structure(
             mode='scalar',
-            transform=[3, [4, float]],
+            # transform=[3, [4, float]],
+            transform=mat3x4,
             instanceCustomIndex=[3, torch.uint8],
             mask=torch.uint8,
             instanceShaderBindingTableRecordOffset=[3, torch.uint8],

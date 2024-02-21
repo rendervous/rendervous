@@ -1,6 +1,6 @@
 import torch
 import math
-from typing import Any
+from typing import Any, Union, Optional
 
 
 def _tensify(t, dimension):
@@ -45,10 +45,12 @@ class GTensorMeta(torch._C._TensorMeta):
             'vec2': (2,),
             'vec3': (3,),
             'vec4': (4,),
-            'mat1': (1,1),
-            'mat2': (2,2),
-            'mat3': (3,3),
-            'mat4': (4,4),
+            'mat1': (1, 1),
+            'mat2': (2, 2),
+            'mat3': (3, 3),
+            'mat3x4': (3, 4),
+            'mat4x3': (4, 3),
+            'mat4': (4, 4),
         }
         if name not in dict:
             return tensor_type
@@ -116,6 +118,8 @@ __SHAPE_TO_TYPE__ = {
     # (1, 1): 'mat1',
     (2, 2): 'mat2',
     (3, 3): 'mat3',
+    (3, 4): 'mat3x4',
+    (4, 3): 'mat4x3',
     (4, 4): 'mat4'
 }
 
@@ -138,15 +142,18 @@ class _GTensorBase(torch.Tensor, metaclass=GTensorMeta):
 
     @classmethod
     def length(cls, x):
+        assert cls.dimension == 1
         return _tensify_batch(torch.sqrt((x**2).sum(dim=-1, keepdim=True)), x.batch_shape)
 
     @classmethod
     def dot(cls, a, b):
+        assert cls.dimension == 1
         return (a*b).sum(-1, keepdim=True)
 
     @classmethod
-    def normalize(self, v):
-        return v / torch.sqrt(_GTensorBase.dot(v, v))  #.detach()
+    def normalize(cls, v):
+        assert cls.dimension == 1
+        return v / torch.sqrt(cls.dot(v, v))  #.detach()
 
     @classmethod
     def identity(cls):
@@ -278,7 +285,33 @@ class mat2(_GTensorBase):
 
 
 class mat3(_GTensorBase):
-    pass
+    @staticmethod
+    def rotation(axis: vec3, angle: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            batched = len(axis.shape) > 1
+            axis = axis.view(-1, 3)
+            angle = angle.view(-1, 1)
+            cos_theta = torch.cos(angle)
+            sin_theta = torch.sin(angle)
+            ux = axis[:, 0:1]
+            uy = axis[:, 1:2]
+            uz = axis[:, 2:3]
+            m = torch.cat(
+                [
+                    cos_theta + ux ** 2 * (1 - cos_theta),
+                    ux * uy * (1 - cos_theta) - uz * sin_theta,
+                    ux * uz * (1 - cos_theta) + uy * sin_theta,
+
+                    uy * ux * (1 - cos_theta) + uz * sin_theta,
+                    cos_theta + uy ** 2 * (1 - cos_theta),
+                    uy * uz * (1 - cos_theta) - ux * sin_theta,
+
+                    uz * ux * (1 - cos_theta) - uy * sin_theta,
+                    uz * uy * (1 - cos_theta) + ux * sin_theta,
+                    cos_theta + uz ** 2 * (1 - cos_theta)
+                ], dim=-1
+            )
+            return mat3(m.view(3, 3) if not batched else m.view(-1, 3, 3))
 
 
 # class LookAtAutograd(torch.autograd.Function):
@@ -303,7 +336,74 @@ class mat3(_GTensorBase):
 #     def backward(ctx: Any, *args: Any) -> Any:
 
 
+class mat3x4(_GTensorBase):
 
+    @staticmethod
+    def composite(internal: Optional[Union['mat3x4', torch.Tensor]],
+                  external: Optional[Union['mat3x4', torch.Tensor]]) -> 'mat3x4':
+        if internal is None:
+            return external
+        if external is None:
+            return internal
+        Ra = internal[..., :3, :3]
+        Rb = external[..., :3, :3]
+        Ta = internal[..., :3, 3:4]
+        Tb = internal[..., :3, 3:4]
+        return mat3x4(torch.cat([Ra @ Rb, Ra @ Tb + Ta], dim=-1))
+
+
+class mat4x3(_GTensorBase):
+    @staticmethod
+    def trs(offset: vec3, axis: vec3, angle: Union[float, torch.Tensor], scale: vec3) -> 'mat4x3':
+        if isinstance(angle, float) or isinstance(angle, int):
+            angle = torch.full(size=(*offset.shape[:-1], 1), fill_value=angle)
+        with torch.no_grad():
+            batched = len(axis.shape) > 1
+            axis = axis.view(-1, 3)
+            angle = angle.view(-1, 1)
+            scale = scale.view(-1, 3)
+            cos_theta = torch.cos(angle)
+            sin_theta = torch.sin(angle)
+            ux = axis[:, 0:1]
+            uy = axis[:, 1:2]
+            uz = axis[:, 2:3]
+            zeros = torch.zeros_like(ux)
+            ones = torch.ones_like(ux)
+            s = torch.cat([
+                scale[:, 0:1], zeros, zeros, zeros,
+                zeros, scale[:, 1:2], zeros, zeros,
+                zeros, zeros, scale[:, 2:3], zeros,
+                zeros, zeros, zeros, ones
+            ], dim=-1).view(-1, 4, 4)
+            m = torch.cat(
+                [
+                    cos_theta + ux ** 2 * (1 - cos_theta),
+                    ux * uy * (1 - cos_theta) - uz * sin_theta,
+                    ux * uz * (1 - cos_theta) + uy * sin_theta,
+
+                    uy * ux * (1 - cos_theta) + uz * sin_theta,
+                    cos_theta + uy ** 2 * (1 - cos_theta),
+                    uy * uz * (1 - cos_theta) - ux * sin_theta,
+
+                    uz * ux * (1 - cos_theta) - uy * sin_theta,
+                    uz * uy * (1 - cos_theta) + ux * sin_theta,
+                    cos_theta + uz ** 2 * (1 - cos_theta),
+
+                    offset.repeat(len(ux), 1)
+                ], dim=-1
+            ).view(-1, 4, 3)
+            T = s @ m
+            if not batched:
+                T = T.squeeze(0)
+            return T
+
+    @staticmethod
+    def composite(internal: Optional[Union['mat4x3', torch.Tensor]], external: Optional[Union['mat4x3', torch.Tensor]]) -> 'mat4x3':
+        if internal is None:
+            return external
+        if external is None:
+            return internal
+        return None  # TODO:
 
 
 class mat4(_GTensorBase):
@@ -318,4 +418,53 @@ class mat4(_GTensorBase):
         exp_zaxis = torch.cat([zaxis, torch.zeros(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
         exp_ori = torch.cat([ori, torch.ones(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
         return mat4(torch.cat([exp_xaxis, exp_yaxis, exp_zaxis, exp_ori], dim=-2))
+
+    def inverse(self):
+        return mat4(torch.linalg.inv(self))
+
+    @staticmethod
+    def trs(offset: vec3, axis: vec3, angle: Union[float, torch.Tensor], scale: vec3) -> torch.Tensor:
+        if isinstance(angle, float) or isinstance(angle, int):
+            angle = torch.full(size=(*offset.shape[:-1], 1), fill_value=angle)
+        with torch.no_grad():
+            batched = len(axis.shape) > 1
+            axis = axis.view(-1, 3)
+            angle = angle.view(-1, 1)
+            scale = scale.view(-1, 3)
+            cos_theta = torch.cos(angle)
+            sin_theta = torch.sin(angle)
+            ux = axis[:, 0:1]
+            uy = axis[:, 1:2]
+            uz = axis[:, 2:3]
+            zeros = torch.zeros_like(ux)
+            ones = torch.ones_like(ux)
+            s = torch.cat([
+                scale[:, 0:1], zeros, zeros, zeros,
+                zeros, scale[:, 1:2], zeros, zeros,
+                zeros, zeros, scale[:, 2:3], zeros,
+                zeros, zeros, zeros, ones
+            ], dim=-1).view(-1, 4, 4)
+            m = torch.cat(
+                [
+                    cos_theta + ux ** 2 * (1 - cos_theta),
+                    ux * uy * (1 - cos_theta) - uz * sin_theta,
+                    ux * uz * (1 - cos_theta) + uy * sin_theta,
+
+                    uy * ux * (1 - cos_theta) + uz * sin_theta,
+                    cos_theta + uy ** 2 * (1 - cos_theta),
+                    uy * uz * (1 - cos_theta) - ux * sin_theta,
+
+                    uz * ux * (1 - cos_theta) - uy * sin_theta,
+                    uz * uy * (1 - cos_theta) + ux * sin_theta,
+                    cos_theta + uz ** 2 * (1 - cos_theta),
+
+                    offset.repeat(len(ux), 1)
+                ], dim=-1
+            ).view(-1, 4, 3)
+            T = s @ m
+            if not batched:
+                T = T.squeeze(0)
+            return T
+
+
 

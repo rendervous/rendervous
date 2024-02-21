@@ -1,7 +1,7 @@
 from .rendering import object_buffer, compile_shader_file, Layout, \
     compute_manager, pipeline_compute, submit, ComputeManager
-from ._gmath import *
-from typing import Optional, List, Tuple, Union, Callable, Dict, NamedTuple
+from rendervous.rendering._gmath import *
+from typing import Optional, List, Tuple, Callable, Dict
 import os
 
 

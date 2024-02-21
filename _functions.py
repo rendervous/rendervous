@@ -1,15 +1,13 @@
 from ._internal import FunctionBase, device  #, ExtensionRendererModule
-from .rendering import tensor, tensor_like, wrap
-from typing import List, Tuple, Optional
+from .rendering import tensor, tensor_like, wrap_gpu
+from typing import Tuple, Optional
 import torch
-from ._gmath import vec3
+from rendervous.rendering._gmath import vec3
 import os
 import math
 
 
 __FUNCTIONS_FOLDER__ = os.path.dirname(__file__).replace('\\', '/') + "/include/functions"
-
-from .rendering.backend._vulkan_internal import syncronize_external_computation
 
 
 def random_sphere_points(N, *, seed: int = 13, radius: float = 1.0):
@@ -57,9 +55,9 @@ class _dummy_function(FunctionBase):
         self.alpha = alpha
         if out is None:
             out = tensor_like(a)
-        self.a = wrap(a)
-        self.b = wrap(b)
-        self.out = wrap(out, 'out')
+        self.a = wrap_gpu(a)
+        self.b = wrap_gpu(b)
+        self.out = wrap_gpu(out, 'out')
         return (a.numel(), 1, 1)
 
     def result(self) -> torch.Tensor:
@@ -86,7 +84,7 @@ class _random_ids(FunctionBase):
         if out is None:
             out = tensor(N, len(shape), dtype=torch.long)
             # out = torch.zeros(N, len(shape), dtype=torch.long)
-        self.out_tensor = wrap(out, 'out')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(shape)
         for i in range(self.dim):
             self.shape[i] = shape[i]
@@ -120,8 +118,8 @@ class _gridtoimg(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -154,8 +152,8 @@ class _imgtogrid(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -229,8 +227,8 @@ class _resample_grid(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -277,8 +275,8 @@ class _resample_img(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -327,8 +325,8 @@ class _total_variation(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape)-1
         for i in range(self.dim + 1):
             self.shape[i] = in_tensor.shape[i]
@@ -359,9 +357,9 @@ class _total_variation_backward(FunctionBase):
             out = torch.zeros(*out_shape, dtype=torch.float, device=device())
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_grad_tensor = wrap(out_grad_tensor, 'in')
-        self.in_grad_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_grad_tensor = wrap_gpu(out_grad_tensor, 'in')
+        self.in_grad_tensor = wrap_gpu(out, 'out')
         self.dim = len(out_shape)-1
         for i in range(self.dim + 1):
             self.shape[i] = in_tensor.shape[i]
@@ -412,8 +410,8 @@ class _copy_img_to_morton(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.resolution = resolution
         self.output_dim = out_shape[-1]
         return (resolution*resolution, 1, 1)
@@ -450,8 +448,8 @@ class _copy_morton_to_img(FunctionBase):
             out = tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap(in_tensor, 'in')
-        self.out_tensor = wrap(out, 'out')
+        self.in_tensor = wrap_gpu(in_tensor, 'in')
+        self.out_tensor = wrap_gpu(out, 'out')
         self.resolution = resolution
         self.output_dim = out_shape[-1]
         return (resolution*resolution, 1, 1)

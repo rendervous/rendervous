@@ -1,10 +1,7 @@
-from ._vulkan import *
-from typing import *
 from enum import Enum
 from ._vulkan_memory_allocator import *
 from ._enums import *
 from ._common import *
-from rendervous._gmath import  GTensorMeta
 import struct
 import gc
 import torch
@@ -55,7 +52,7 @@ __BUFFER_USAGE_2_VK__ = [
     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+    VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR
 ]
 
 
@@ -306,6 +303,7 @@ class ResourceData:
     Also wraps memory allocated for raw tensors, without a vulkan resource backed, when vk_resource is None.
     """
     def __init__(self,
+                 w_device,
                  vk_device,
                  vk_description,
                  vk_memory_location,
@@ -315,6 +313,7 @@ class ResourceData:
                  initial_state
                  ):
         super(ResourceData, self).__init__()
+        self.w_device = w_device
         self.vk_device = vk_device
         self.vk_description = vk_description
         self.vk_memory_location = vk_memory_location
@@ -382,6 +381,7 @@ class ResourceData:
     @trace_destroying
     def __del__(self):
         self._vk_destroy()
+        self.w_device = None
 
     def get_device_ptr(self, slice = None):
         assert self.is_buffer, "Only buffers can be considered continuous in memory."
@@ -669,22 +669,24 @@ class ResourceWrapper:
         self.current_slice = resource_slice
         self.is_readonly = False
 
-
     def clear(self, w_device: 'DeviceWrapper'):
         ResourceData.clear(w_device, self)
         return self
 
-    # @trace_destroying
-    def __del__(self):
+    def _vk_destroy(self):
         # Destroy view if any
         if self.vk_view is not None:
             if self.resource_data.is_buffer:
                 vkDestroyBufferView(self.vk_device, self.vk_view, None)
             else:
                 vkDestroyImageView(self.vk_device, self.vk_view, None)
+        self.vk_view = None
         self.resource_data = None
         self.vk_device = None
-        self.vk_view = None
+
+    # @trace_destroying
+    def __del__(self):
+        self._vk_destroy()
 
     @lazy_constant
     def device_ptr(self):
@@ -826,7 +828,7 @@ class ResourceWrapper:
             b = self.as_tensor(t.dtype).view(t.shape)
             t.copy_(b)
         else:
-            staging = w_device.create_buffer(self.get_size(), BufferUsage.STAGING, MemoryLocation.CPU)
+            staging = w_device.create_buffer(self.size, BufferUsage.STAGING, MemoryLocation.CPU if t.is_cpu else MemoryLocation.GPU)
             self.save(w_device, staging)
             staging.save(w_device, t)
         return self
@@ -883,6 +885,7 @@ class ResourceWrapper:
                     ),
                     subresourceRange=ResourceData.get_subresources(self.current_slice)
                 ), None)
+            self.resource_data.w_device.notify_view(self)
         return self.vk_view
 
     @lazy_constant
@@ -995,6 +998,8 @@ class PipelineBindingWrapper:
         # Destroy desciptor sets
         if self.w_device is None:
             return
+        self.shaders = {}
+        self.rt_shaders = []
         vkDestroyDescriptorPool(self.w_device.vk_device, self.descriptor_pool, None)
         # Destroy layouts
         [vkDestroyDescriptorSetLayout(self.w_device.vk_device, dl, None) for dl in self.descriptor_set_layouts]
@@ -1004,10 +1009,10 @@ class PipelineBindingWrapper:
         # Destroy pipeline object
         if self.pipeline_object:
             vkDestroyPipeline(self.w_device.vk_device, self.pipeline_object, None)
+            self.pipeline_object = None
         self.descriptor_sets_description = [[], [], [], []]
         self.active_set = 0
         self.active_descriptor_set = None
-        self.shaders = {}
         self.descriptor_set_layouts = []
         self.descriptor_sets = None
         self.descriptor_pool = None
@@ -1713,7 +1718,8 @@ class CommandPoolWrapper:
             vkQueueSubmit(self.vk_queue, 1,
                           self.single_submit_info_ptr
                           , self.submit_fence[self.submit_index])
-            vkWaitForFences(self.vk_device, 1, self.submit_fence[self.submit_index:self.submit_index+1], True, int(3e13))
+            vkWaitForFences(self.vk_device, 1, self.submit_fence[self.submit_index:self.submit_index+1], True, int(1e9)*10)
+            # vkWaitForFences(self.vk_device, 1, self.submit_fence[self.submit_index:self.submit_index+1], True, int(3e13))
             # self.submit_index = (self.submit_index + 1) % 128
             if self.submit_index == 127:
                 self.submit_index = 0
@@ -1805,8 +1811,10 @@ class WindowWrapper(object):
 class DeviceWrapper:
     def __init__(self, enable_validation_layers):
         self.enable_validation_layers = enable_validation_layers
+        # this is ugly, we need to change for a proper dependency graph in rendervous objects
         self.__resources = weakref.WeakSet()
         self.__pipelines = weakref.WeakSet()
+        self.__views = weakref.WeakSet()
         self.vk_device = None
         self.__instance = None
         self.__callback = None
@@ -1837,6 +1845,9 @@ class DeviceWrapper:
 
         for p in self.__pipelines:  # Clean all pipelines hanging
             p._vk_destroy()
+
+        for v in self.__views:
+            v._vk_destroy()
 
         for b in self.__resources:  # Clean all resources hanging
             b._vk_destroy()
@@ -2033,12 +2044,17 @@ class DeviceWrapper:
 
         if self.support_raytracing:
             extensions += [
-            # "VK_KHR_ray_query",   # Not supported in 1080, do not decomment
             "VK_KHR_deferred_host_operations",
             "VK_KHR_pipeline_library",
             "VK_KHR_acceleration_structure",
             "VK_KHR_ray_tracing_pipeline",
             ]
+
+        if self.support_raytracing_query:
+            extensions += [
+                "VK_KHR_ray_query",
+            ]
+
         if self.support_cooperative_matrices:
             extensions += [
                 "VK_NV_cooperative_matrix",
@@ -2064,9 +2080,13 @@ class DeviceWrapper:
         coop_features = VkPhysicalDeviceCooperativeMatrixFeaturesNV(
             cooperativeMatrix=self.support_cooperative_matrices
         )
+        rtq_features = VkPhysicalDeviceRayQueryFeaturesKHR(
+            rayQuery=self.support_raytracing_query
+        )
 
         append_chain(self.support_cooperative_matrices, storage_features)
         append_chain(self.support_cooperative_matrices, coop_features)
+        append_chain(self.support_raytracing_query, rtq_features)
 
         atom_features =  VkPhysicalDeviceShaderAtomicFloatFeaturesEXT(
             shaderBufferFloat32Atomics=self.support_atomic_float_add,
@@ -2268,7 +2288,8 @@ class DeviceWrapper:
         feat_atom = VkPhysicalDeviceShaderAtomicFloatFeaturesEXT(pNext=feat_atom2)
         feat_rob = VkPhysicalDeviceRobustness2FeaturesEXT(pNext=feat_atom)
         feat_ads = VkPhysicalDeviceAccelerationStructureFeaturesKHR(pNext=feat_rob)
-        feat_address = VkPhysicalDeviceBufferDeviceAddressFeatures(pNext=feat_ads)
+        feat_qrt = VkPhysicalDeviceRayQueryFeaturesKHR(pNext=feat_ads)
+        feat_address = VkPhysicalDeviceBufferDeviceAddressFeatures(pNext=feat_qrt)
         self.__physical_device_features2 = VkPhysicalDeviceFeatures2(pNext=feat_address)
         vkGetPhysicalDeviceFeatures2 = vkGetInstanceProcAddr(self.__instance, 'vkGetPhysicalDeviceFeatures2KHR')
         vkGetPhysicalDeviceFeatures2(self.__physical_device, self.__physical_device_features2)
@@ -2286,6 +2307,7 @@ class DeviceWrapper:
         self.support_buffer_map = torch.cuda.is_available()  # right now direct vulkan-torch interop is only valid for cuda
         self.support_torch_map = os.name == 'nt'  # TODO: this should be checking if virtual gpu pointers are used or not, no the system
         self.support_atomic_float_add = feat_atom.shaderBufferFloat32AtomicAdd
+        self.support_raytracing_query = feat_qrt.rayQuery > 0
 
         if self.support_cooperative_matrices:
             # This is needed? probably to fetch some properties and activate?
@@ -2456,10 +2478,13 @@ class DeviceWrapper:
         buffer = vkCreateBuffer(self.vk_device, info, None)
         w_memory : VulkanMemory = self.memory_manager.allocate_memory_for_buffer(buffer, location)
         vkBindBufferMemory(self.vk_device, buffer, w_memory.vulkan_memory, w_memory.vulkan_memory_offset)
-        resource_data = ResourceData(self.vk_device, info, location, buffer, w_memory, True,
+        resource_data = ResourceData(self, self.vk_device, info, location, buffer, w_memory, True,
                                self.__resolve_initial_state())
         self.__resources.add(resource_data)
         return resource_data
+
+    def notify_view(self, view):
+        self.__views.add(view)
 
     def create_buffer(self, size: int, usage: BufferUsage, memory: MemoryLocation):
         return ResourceWrapper(resource_data=self._create_buffer_data(size, usage, memory))
@@ -2468,20 +2493,20 @@ class DeviceWrapper:
         if w_resource is None:
             return None
         add = VkDeviceOrHostAddressKHR()
-        if w_resource.resource_data.is_gpu:
-            add.deviceAddress = w_resource.device_ptr
-        else:
-            add.hostAddress = ffi.cast('void*', w_resource.device_ptr)
+        # if w_resource.resource_data.is_gpu:
+        add.deviceAddress = w_resource.device_ptr
+        # else:
+        #     add.hostAddress = ffi.cast('void*', w_resource.device_ptr)
         return add
 
     def _get_device_address_const(self, w_resource: ResourceWrapper):
         if w_resource is None:
             return None
         add = VkDeviceOrHostAddressConstKHR()
-        if w_resource.resource_data.is_gpu:
-            add.deviceAddress = w_resource.device_ptr
-        else:
-            add.hostAddress = ffi.cast('const void*', w_resource.device_ptr)
+        # if w_resource.resource_data.is_gpu:
+        add.deviceAddress = w_resource.device_ptr
+        # else:
+        #     add.hostAddress = ffi.cast('const void*', w_resource.device_ptr)
         return add
 
     def _resolve_description(self, geometry_type, element_description):
@@ -2501,9 +2526,9 @@ class DeviceWrapper:
                 transformData=self._get_device_address_const(t)
             )))
             if i:
-                primitives = i.get_size() // 4 // 3
+                primitives = i.size // 4 // 3
             else:
-                primitives = v.get_size() // v_stride // 3
+                primitives = v.size // v_stride // 3
         elif geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR:
             aabbs = element_description
             data = VkAccelerationStructureGeometryKHR(
@@ -2590,7 +2615,7 @@ class DeviceWrapper:
         image = vkCreateImage(self.vk_device, info, None)
         w_memory : VulkanMemory = self.memory_manager.allocate_memory_for_image(image, properties)
         vkBindImageMemory(self.vk_device, image, w_memory.vulkan_memory, w_memory.vulkan_memory_offset)
-        resource_data = ResourceData(self.vk_device, info, properties, image, w_memory, False,
+        resource_data = ResourceData(self, self.vk_device, info, properties, image, w_memory, False,
                                      self.__resolve_initial_state())
         ResourceData.initialize_image(self, resource_data)
         self.__resources.add(resource_data)
@@ -2603,7 +2628,7 @@ class DeviceWrapper:
             from OpenGL.GL.EXT.memory_object_win32 import glImportMemoryWin32HandleEXT, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT
         else:
             from OpenGL.GL.EXT.memory_object_fd import glImportMemoryFdEXT, GL_HANDLE_TYPE_OPAQUE_FD_EXT
-        from OpenGL.GL.EXT.memory_object import glTextureStorageMem2DEXT, glTexStorageMem2DEXT
+        from OpenGL.GL.EXT.memory_object import glTexStorageMem2DEXT
 
         memory_object = ctypes.c_uint(0)
         glCreateMemoryObjectsEXT(1, memory_object)
@@ -2654,7 +2679,7 @@ class DeviceWrapper:
             from OpenGL.GL.EXT.memory_object_win32 import glImportMemoryWin32HandleEXT, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT
         else:
             from OpenGL.GL.EXT.memory_object_fd import glImportMemoryFdEXT, GL_HANDLE_TYPE_OPAQUE_FD_EXT
-        from OpenGL.GL.EXT.memory_object import glTextureStorageMem2DEXT, glTexStorageMem2DEXT
+        from OpenGL.GL.EXT.memory_object import glTexStorageMem2DEXT
 
         memory_object = ctypes.c_uint(0)
         glCreateMemoryObjectsEXT(1, memory_object)

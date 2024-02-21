@@ -29,7 +29,7 @@ from ._rendering_internal import Resource, Buffer, Image, GeometryCollection, Tr
     pipeline_raytracing, \
     flush, \
     submit, \
-    wrap, GPUPtr, \
+    wrap_gpu, GPUPtr, \
     torch_ptr_to_device_ptr, \
     load_technique, dispatch_technique, \
     execute_loop, allow_cross_threading, set_debug_name, window, external_sync, support, \
@@ -37,3 +37,4 @@ from ._rendering_internal import Resource, Buffer, Image, GeometryCollection, Tr
 
 from .backend._enums import *
 from .backend._common import StructuredTensor, Layout
+from ._gmath import *

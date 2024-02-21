@@ -153,7 +153,7 @@ mat4 PerspectiveFovLH(float fieldOfView, float aspectRatio, float znearPlane, fl
 		0, 0, -znearPlane * zfarPlane / (zfarPlane - znearPlane), 0);
 }
 
-vec3 usc_to_dir(vec2 angles)
+vec3 usc2dir(vec2 angles)
 {
     float y = cos(angles.y);
     float s = sin(angles.y);
@@ -162,10 +162,72 @@ vec3 usc_to_dir(vec2 angles)
     return vec3(x, y, z);
 }
 
-vec2 dir_to_usc(vec3 w) {
-    float beta = acos(w.y);
+vec2 dir2usc(vec3 w) {
+    w.x += 0.0000001 * int(w.x == 0.0 && w.z == 0.0);
+    float beta = acos(clamp(w.y, -1.0, 1.0));
     float alpha = atan(w.x, w.z);
     return vec2(alpha, beta);
+}
+
+vec2 dir2xr(vec3 w)
+{
+    w.x += 0.0000001 * int(w.x == 0.0 && w.z == 0.0);
+    float x = atan(w.x, w.z) * inverseOfPi;
+    float y = -2 * asin(clamp(w.y, -1.0, 1.0)) * inverseOfPi;
+    return vec2(x, y);
+}
+
+vec3 xr2dir(vec2 c)
+{
+    vec2 angles = vec2(c.x * pi, c.y * piOverTwo);
+    float y = -sin(angles.y);
+    float r = cos(angles.y);
+    float x = sin(angles.x) * r;
+    float z = cos(angles.x) * r;
+    return vec3(x, y, z);
+}
+
+
+// MORTON CODE FUNCTIONS
+// Adapted from https://gist.github.com/wontonst/8696dcfb643121c864dec7c0d6ad26c5
+
+int part1by1(int n){
+    n &= 0x0000ffff;
+    n = (n | (n << 8)) & 0x00FF00FF;
+    n = (n | (n << 4)) & 0x0F0F0F0F;
+    n = (n | (n << 2)) & 0x33333333;
+    n = (n | (n << 1)) & 0x55555555;
+    return n;
+}
+
+int unpart1by1(int n){
+    n &= 0x55555555; // base10: 1431655765, binary: 1010101010101010101010101010101,  len: 31
+    n = (n ^ (n >> 1)) & 0x33333333; // base10: 858993459,  binary: 110011001100110011001100110011,   len: 30
+    n = (n ^ (n >> 2)) & 0x0f0f0f0f; // base10: 252645135,  binary: 1111000011110000111100001111,     len: 28
+    n = (n ^ (n >> 4)) & 0x00ff00ff; // base10: 16711935,   binary: 111111110000000011111111,         len: 24
+    n = (n ^ (n >> 8)) & 0x0000ffff; // base10: 65535,      binary: 1111111111111111,                 len: 16
+    return n;
+}
+
+void morton2pixel(int index, out int px, out int py)
+{
+    px = unpart1by1(index);
+    py = unpart1by1(index >> 1);
+}
+
+ivec2 morton2pixel(int index)
+{
+    return ivec2(unpart1by1(index), unpart1by1(index >> 1));
+}
+
+void pixel2morton(int px, int py, out int index)
+{
+    index = part1by1(px) | (part1by1(py) << 1);
+}
+
+int pixel2morton(ivec2 px)
+{
+    return part1by1(px.x) | (part1by1(px.y) << 1);
 }
 
 
