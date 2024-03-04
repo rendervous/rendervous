@@ -5,6 +5,107 @@ Requires:
 - volumes_scattering
 */
 
+float scene_visibility2(map_object, vec3 xa, vec3 xb)
+{
+    vec3 x = xa;
+    vec3 w = xb - xa;
+    float total_distance = length(w);
+    if (total_distance <= 0.0000001)
+        return 1.0;
+    w /= total_distance;
+
+    float T = 1.0;
+
+    for (int i=0; i<50; i++)
+    {
+        float d;
+        int patch_index;
+        bool is_entering;
+        if (!raycast(object, x, w, d, is_entering, patch_index))
+            return T;
+
+        VSPatchInfo patch_info = parameters.patch_info[patch_index];
+
+        GPUPtr current_medium = is_entering ? 0 : patch_info.inside_medium;
+
+        float vd = min(total_distance, d);
+
+        if (current_medium != 0)
+        {
+            float vT;
+            vec3 vW, vA;
+            vec3 xo, wo;
+            medium_traversal(object, current_medium, x, w, vd, vT, xo, wo, vW, vA);
+            T *= vT;
+            // T *= exp(-vd*5);
+        }
+
+        total_distance -= vd;
+
+        if (total_distance <= 0.00001) // traversed segment or opaque estimation within a volume
+        return T;
+
+        // Check scatter at surface
+        if (T < 0.000001 || patch_info.surface_scatters != 0)
+            return 0; // surface between xa-xb
+
+        x += w * (vd + 0.00001); // traverse volume distance and the epsilon to traspass the boundary in same direction
+        total_distance -= 0.00001;
+    }
+
+    return 0.0;
+}
+
+void scene_visibility_bw(map_object, vec3 xa, vec3 xb, float out_T, float dL_dT)
+{
+    //PRINT("Inside Backward of visibility");
+
+    if (out_T == 0.0)
+    return; // no backprop necessary
+
+    vec3 x = xa;
+    vec3 w = xb - xa;
+    float total_distance = length(w);
+    if (total_distance <= 0.0000001)
+        return;
+    w /= total_distance;
+
+    float T = 1.0;
+    for (int i=0; i<50; i++)
+    {
+        float d;
+        int patch_index;
+        bool is_entering;
+        if (!raycast_from_bw(object, x, w, d, is_entering, patch_index))
+            return;
+
+        VSPatchInfo patch_info = parameters.patch_info[patch_index];
+        GPUPtr current_medium = is_entering ? 0 : patch_info.inside_medium;
+        float vd = min(total_distance, d);
+
+        if (current_medium != 0)
+        {
+            float vT;
+            vec3 vW, vA;
+            vec3 xo, wo;
+            SAVE_SEED(before_traversal)
+            medium_traversal(object, current_medium, x, w, vd, vT, xo, wo, vW, vA);
+            T *= vT;
+            SET_SEED(before_traversal)
+            medium_traversal_bw(object, current_medium, x, w, vd, vT, vW, vA, dL_dT*out_T/vT, vec3(0.0), vec3(0.0));
+        }
+        total_distance -= vd;
+        if (total_distance <= 0.00001) // traversed segment or opaque estimation within a volume
+        return;
+        // Check scatter at surface
+        if (T < 0.000001 || patch_info.surface_scatters != 0)
+            return; // surface between xa-xb
+        x += w * (vd + 0.00001); // traverse volume distance and the epsilon to traspass the boundary in same direction
+        total_distance -= 0.00001;
+    }
+}
+
+
 float scene_visibility(map_object, vec3 xa, vec3 xb)
 {
     vec3 x = xa;

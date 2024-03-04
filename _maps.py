@@ -1,3 +1,5 @@
+from enum import IntEnum
+
 from .rendering import Layout, lazy_constant, tensor, object_buffer, ObjectBufferAccessor, pipeline_compute, \
     compute_manager, submit, wrap_gpu, BufferUsage, MemoryLocation
 from ._internal import device, get_seeds, __INCLUDE_PATH__
@@ -25,6 +27,13 @@ def torch_fallback(enable=True):
             global __USE_VULKAN_DISPATCHER__
             __USE_VULKAN_DISPATCHER__ = current_dipatcher
     return _using_torch_context()
+
+
+class BACKWARD_IMPLEMENTATIONS(IntEnum):
+    NONE = 0
+    DEFAULT = 1
+    WITH_OUTPUT = 2
+    ALL = 3
 
 
 class DispatcherEngine:
@@ -149,18 +158,10 @@ class DispatcherEngine:
         return type_definition.__name__, {}, []  # vec and mats
 
     @classmethod
-    def create_prototype_for_dynamic_map(cls, map: 'MapMeta'):
-        input_dim = map.default_generics['INPUT_DIM']
-        output_dim = map.default_generics['OUTPUT_DIM']
-        return f"""
-void dynamic_forward (GPUPtr dynamic_map, in float _input[{input_dim}], out float _output[{output_dim}]);
-void dynamic_backward (GPUPtr dynamic_map, in float _input[{input_dim}], in float _output_grad[{output_dim}], out float _input_grad[{input_dim}]);
-        """
-
-    @classmethod
     def create_code_for_dynamic_map(cls, input_dim, output_dim):
         fw_cases = ""
         bw_cases = ""
+        bw_using_output_cases = ""
         sig = (input_dim, output_dim)
         if sig in cls.__MAP_BY_SIGNATURE__:
             for (id, code_name) in cls.__MAP_BY_SIGNATURE__[sig]:
@@ -169,6 +170,9 @@ void dynamic_backward (GPUPtr dynamic_map, in float _input[{input_dim}], in floa
                 """
                 bw_cases += f"""
                 case {id}: backward({code_name}(buffer_{code_name}(dynamic_map)), _input, _output_grad, _input_grad); break;
+                """
+                bw_using_output_cases += f"""
+                case {id}: backward({code_name}(buffer_{code_name}(dynamic_map)), _input, _output, _output_grad, _input_grad); break;
                 """
         return f"""
 void dynamic_forward (map_object, GPUPtr dynamic_map, in float _input[{input_dim}], out float _output[{output_dim}]) {{
@@ -183,11 +187,8 @@ void dynamic_forward (map_object, GPUPtr dynamic_map, in float _input[{input_dim
     }}  
 }}
 
-void dynamic_backward(map_object, GPUPtr dynamic_map, in float _input[{input_dim}], in float _output_grad[{output_dim}], out float _input_grad[{input_dim}])  {{
-    if (dynamic_map == 0) {{
-        [[unroll]] for (int i=0; i<{input_dim}; i++) _input_grad[i] = 0.0;
-        return;
-    }}
+void dynamic_backward(map_object, GPUPtr dynamic_map, in float _input[{input_dim}], in float _output_grad[{output_dim}], inout float _input_grad[{input_dim}])  {{
+    if (dynamic_map == 0) return;
     int map_id = int_ptr(dynamic_map).data[0];
     switch(map_id)
     {{
@@ -195,6 +196,14 @@ void dynamic_backward(map_object, GPUPtr dynamic_map, in float _input[{input_dim
     }}  
 }}
 
+void dynamic_backward(map_object, GPUPtr dynamic_map, in float _input[{input_dim}], in float _output[{output_dim}], in float _output_grad[{output_dim}], inout float _input_grad[{input_dim}])  {{
+    if (dynamic_map == 0) return;
+    int map_id = int_ptr(dynamic_map).data[0];
+    switch(map_id)
+    {{
+    {bw_using_output_cases}
+    }}  
+}}
     
         """
 
@@ -229,10 +238,32 @@ struct {codename} {{ buffer_{codename} data; }};
             cls.__MAP_BY_SIGNATURE__[(map.input_dim, map.output_dim)] = []
         cls.__MAP_BY_SIGNATURE__[(map.input_dim, map.output_dim)].append((instance_id, codename))
 
-        if map.non_differentiable:
+        if map.bw_implementations == BACKWARD_IMPLEMENTATIONS.NONE:
+            # Add default implementation for both bw modes
             code += """
-void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM]) {  }
-"""
+            void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM]) {  }
+            void backward (map_object, float _input[INPUT_DIM], float _output[OUTPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM]) {  }
+            """
+        elif map.bw_implementations == BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT:
+            # If only default implementation is provided, add an implementation of bw based on bw using output, re-computing the output
+            code += """
+            void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM]) {
+                float _output[OUTPUT_DIM];
+                SAVE_SEED(before_fw)
+                forward(object, _input, _output);
+                SET_SEED(before_fw)
+                backward(object, _input, _output, _output_grad, _input_grad);  
+            }
+            """
+        elif map.bw_implementations == BACKWARD_IMPLEMENTATIONS.DEFAULT:
+            # add an implementation of a bw using output, ignoring the output
+            code += """
+            void backward (map_object, float _input[INPUT_DIM], float _output[OUTPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM]) {
+                backward(object, _input, _output_grad, _input_grad);  
+            }
+            """
+
+        # Add a reduced overload to omit input grad propagation
         code += """
 void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DIM]) {
     float _input_grad[INPUT_DIM];
@@ -278,6 +309,7 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                 main_map=torch.int64,
                                                                                 input=torch.int64,
                                                                                 output_grad=torch.int64,
+                                                                                input_grad=torch.int64,
                                                                                 seeds=ivec4,
                                                                                 start_index=int,
                                                                                 total_threads=int,
@@ -327,6 +359,7 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
         full_code = """
 #version 460
 #extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_debug_printf : enable
 
 #include "common.h"
 
@@ -396,6 +429,8 @@ void main()
         full_code = """
     #version 460
     #extension GL_GOOGLE_include_directive : require
+    #extension GL_EXT_debug_printf : enable
+    
     #include "common.h"
     layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
     
@@ -407,6 +442,7 @@ void main()
         {cls.register_instance(map)[1]} main_map; // Map model to execute
         GPUPtr input_tensor_ptr; // Input tensor (forward and backward stage)
         GPUPtr output_tensor_grad_ptr; // Output tensor (backward stage)
+        GPUPtr input_tensor_grad_ptr; // Input tensor gradients (backward stage)
         uvec4 seeds; // seeds for the batch randoms
         int start_index;
         int total_threads;
@@ -431,7 +467,14 @@ void main()
         int output_dim = {map.output_dim};
         rdv_input_data input_buf = rdv_input_data(input_tensor_ptr + index * input_dim * 4);
         rdv_output_data output_grad_buf = rdv_output_data(output_tensor_grad_ptr + index * output_dim * 4);
-        backward(main_map, input_buf.data, output_grad_buf.data);
+        
+        if (input_tensor_grad_ptr == 0) // no input gradient
+            backward(main_map, input_buf.data, output_grad_buf.data);
+        else
+        {{
+            rdv_input_data input_grad_buff = rdv_input_data(input_tensor_grad_ptr + index * input_dim * 4);
+            backward(main_map, input_buf.data, output_grad_buf.data, input_grad_buff.data);
+        }}
         
         if (debug_tensor_ptr != 0)
         {{
@@ -464,6 +507,8 @@ void main()
         full_code = """
         #version 460
         #extension GL_GOOGLE_include_directive : require
+        #extension GL_EXT_debug_printf : enable
+        
         #include "common.h"
         layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
         
@@ -584,6 +629,8 @@ void main()
         full_code = """
         #version 460
         #extension GL_GOOGLE_include_directive : require
+        #extension GL_EXT_debug_printf : enable
+        
         #include "common.h"
         layout (local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
         
@@ -752,13 +799,15 @@ void main()
     @classmethod
     def eval_capture_backward(cls, capture_object: 'SensorsBase', field: 'MapBase', output_grad: torch.Tensor,
                               sensors: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
-                              bw_samples: int = 1):
+                              bw_samples: int = 1, debug_out: torch.Tensor = None):
         with cls.__LOCKER__:
             if sensors is not None:
                 total_threads = sensors.numel() // sensors.shape[-1]
             else:
                 total_threads = math.prod(capture_object.index_shape[
                                           :capture_object.input_dim]).item()  # capture_object.screen_width * capture_object.screen_height
+
+            assert debug_out is None or debug_out.numel() == total_threads, f"Debug tensor provided has not the required size {total_threads}"
 
             if batch_size is None:
                 batch_size = total_threads
@@ -795,6 +844,7 @@ void main()
                 b.start_index = 0
                 b.total_threads = total_threads
                 b.samples = bw_samples
+                b.debug_ptr = 0 if debug_out is None else wrap_gpu(debug_out, 'out')
 
             for batch in range((total_threads + batch_size - 1) // batch_size):
                 with cls.__ENGINE_OBJECTS__['capture_bw_eval'] as b:
@@ -864,12 +914,18 @@ void main()
             assert output_grad.shape[
                        -1] == map_object.output_dim, f'Wrong last dimension for the output_grad tensor, must be {map_object.output_dim}'
 
+            if input.requires_grad:  #
+                input_grad = torch.zeros_like(input)
+            else:
+                input_grad = None
+
             map_object._pre_eval(True)
 
             with cls.__ENGINE_OBJECTS__['map_bw_eval'] as b:
                 b.main_map = wrap_gpu(map_object)
                 b.input = wrap_gpu(input)
                 b.output_grad = wrap_gpu(output_grad)
+                b.input_grad = wrap_gpu(input_grad, 'inout')
                 b.seeds[:] = get_seeds()
                 b.start_index = 0
                 b.total_threads = total_threads
@@ -877,6 +933,8 @@ void main()
             submit(man)
 
             map_object._pos_eval(True)
+
+            return input_grad
 
 
 def start_engine():
@@ -974,9 +1032,10 @@ class TensorCheck(object):
 
 
 class MapMeta(type):
+    __DYNAMIC_ID__  = 0   # This is an autoincremental id for dynamic maps
     def __new__(cls, name, bases, dct):
         ext_class = super().__new__(cls, name, bases, dct)
-        assert '__extension_info__' in dct, 'Extension maps requires a dict __extension_info__ with path, parameters, [optional] nodiff'
+        assert '__extension_info__' in dct, 'Extension maps requires a dict __extension_info__ with path, parameters, [optional] bw_implementations'
         extension_info = dct['__extension_info__']
         if extension_info is not None:  # is not an abstract node
             extension_path = extension_info.get('path', None)
@@ -993,7 +1052,7 @@ class MapMeta(type):
                 extension_code = f"#include \"{os.path.basename(extension_path)}\"\n"
                 # with open(extension_path) as f:
                 #     extension_code = f.readlines()
-            non_differentiable = extension_info.get('nodiff', False)
+            bw_implementations = extension_info.get('bw_implementations', BACKWARD_IMPLEMENTATIONS.NONE)
 
             def from_type_2_layout_description(p, dynamic_array_size = 0):
                 if p == MapBase:
@@ -1013,14 +1072,18 @@ class MapMeta(type):
             ext_class.map_object_layout = parameters_layout
             ext_class.map_object_definition = parameters
             ext_class.map_source_code = extension_code
-            ext_class.non_differentiable = non_differentiable
-            ext_class.use_raycast = False  # TODO: Remove this.
+            ext_class.bw_implementations = bw_implementations # Determines if the bw uses a cached output evaluation to improve efficiency while replaying, or is default or none
             ext_class.include_dirs = include_dirs
             ext_class.map_code = DispatcherEngine.register_map(ext_class)
         return ext_class
 
     def __call__(self, *args, **kwargs):
         map_instance: MapBase = super(MapMeta, self).__call__(*args, **kwargs)
+        generic_for_dynamic_id = {}
+        if len(self.dynamic_requires) != 0:  # if dynamic module is used
+            MapMeta.__DYNAMIC_ID__  += 1
+            generic_for_dynamic_id = {'RDV_DYNAMIC_ID': MapMeta.__DYNAMIC_ID__ }
+        map_instance.generics.update(generic_for_dynamic_id)
         map_instance._create_signature()
         map_id, map_codename = DispatcherEngine.register_instance(map_instance)
         map_instance.rdv_map_id = map_id
@@ -1060,6 +1123,7 @@ class GPUDirectModule(torch.nn.Module):
         if include_grads:
             for k,v in self._parameters.items():
                 if v.requires_grad:
+                    # print(f'Bound parameter with grad for {k} in {type(self)}')
                     bind_parameter_grad(getattr(self._rdv_accessor, k))
         def deep_pre_eval(m: Union[torch.nn.Module]):
             if isinstance(m, GPUDirectModule):
@@ -1259,7 +1323,6 @@ class Sampler(MapBase):
 
 class MixtureSampler(Sampler):
     __extension_info__ = dict(
-        nodiff=True,
         parameters=dict(
             alpha=MapBase,
             sampler_a=MapBase,
@@ -1293,7 +1356,6 @@ FORWARD
 
 class MixturePDF(MapBase):
     __extension_info__ = dict(
-        nodiff=True,
         parameters=dict(
             alpha=MapBase,
             sampler_a_pdf=MapBase,
@@ -1330,8 +1392,8 @@ class AutogradMapFunction(torch.autograd.Function):
         output_grad, = args
         input_tensor, = ctx.saved_tensors  # Just check for inplace operations in input tensors
         map_object = ctx.map_object
-        DispatcherEngine.eval_map_backward(map_object, input_tensor, output_grad)
-        return (None, None, None)  # append None to refer to renderer object passed in forward
+        input_grad = DispatcherEngine.eval_map_backward(map_object, input_tensor, output_grad)
+        return (input_grad, None, None)  # append None to refer to renderer object passed in forward
 
 
 class AutogradCaptureFunction(torch.autograd.Function):
@@ -1344,6 +1406,7 @@ class AutogradCaptureFunction(torch.autograd.Function):
         ctx.capture_object = capture_object
         ctx.batch_size = batch_size
         ctx.bw_samples = bw_samples
+        ctx.debug_out = debug_out
         return DispatcherEngine.eval_capture_forward(capture_object, field, sensors, batch_size, fw_samples, debug_out)
 
     @staticmethod
@@ -1354,15 +1417,17 @@ class AutogradCaptureFunction(torch.autograd.Function):
         field = ctx.field
         batch_size = ctx.batch_size
         bw_samples = ctx.bw_samples
-        DispatcherEngine.eval_capture_backward(capture, field, output_grad, sensors, batch_size, bw_samples)
+        debug_out = ctx.debug_out
+        DispatcherEngine.eval_capture_backward(capture, field, output_grad, sensors, batch_size, bw_samples, debug_out)
         # print(f"[DEBUG] Backward grads from renderer {grad_inputs[0].mean()}")
         # assert grad_inputs[0] is None or torch.isnan(grad_inputs[0]).sum() == 0, "error in generated grads."
-        return (None, None, None, None, None, None, None)  # append None to refer to renderer object passed in forward
+        return (None, None, None, None, None, None, None, None)  # append None to refer to renderer object passed in forward
 
 
 class Identity(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__+"/maps/identity.h"
+        path=__INCLUDE_PATH__+"/maps/identity.h",
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, dimension: int):
@@ -1458,7 +1523,6 @@ class PerspectiveCameraSensor(SensorsBase):
             znear=float
         ),
         generics=dict(OUTPUT_DIM=6),
-        nodiff=True,
         path=__INCLUDE_PATH__+"/maps/camera_perspective.h"
     )
 
@@ -1495,6 +1559,7 @@ class Composition(MapBase):
             inner=MapBase,
             outter=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
 FORWARD {
     float intermediate [INTERMEDIATE_DIM];
@@ -1507,7 +1572,7 @@ BACKWARD {
     forward(parameters.inner, _input, intermediate);
     float intermediate_grad [INTERMEDIATE_DIM]; [[unroll]] for (int i=0; i<INPUT_DIM; i++) intermediate_grad[i] = 0.0;
     backward(parameters.outter, intermediate, _output_grad, intermediate_grad);
-    backward(parameters.inner, _input, intermediate_grad, _input_grad);
+    backward(parameters.inner, _input, intermediate, intermediate_grad, _input_grad);
 }
 """,
     )
@@ -1532,6 +1597,7 @@ class BinaryOpMap(MapBase):
                 map_a=MapBase,
                 map_b=MapBase
             ),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             code=f"""
 FORWARD {{
     float _temp[OUTPUT_DIM];
@@ -1592,9 +1658,9 @@ class MultiplicationMap(BinaryOpMap):
     __extension_info__ = BinaryOpMap.create_extension_info('*', True, backward_code="""
 float dL_darg[OUTPUT_DIM];
 [[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] * b[i];
-backward(parameters.map_a, _input, dL_darg, _input_grad);
+backward(parameters.map_a, _input, a, dL_darg, _input_grad); // output provided just in case
 [[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] * a[i];
-backward(parameters.map_b, _input, dL_darg, _input_grad);
+backward(parameters.map_b, _input, b, dL_darg, _input_grad); // output provided just in case
     """)
 
     def __init__(self, map_a: MapBase, map_b: MapBase):
@@ -1624,6 +1690,7 @@ backward(parameters.map_b, _input, dL_darg, _input_grad);
 class PromoteMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(map=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
         code="""
 FORWARD {
     float r[1];
@@ -1632,6 +1699,7 @@ FORWARD {
     for (int i=0; i<OUTPUT_DIM; i++)
         _output[i] = r[0];
 }
+
 BACKWARD {
     float dL_dr[1];
     dL_dr[0] = 0.0;
@@ -1640,14 +1708,23 @@ BACKWARD {
         dL_dr[0] += _output_grad[i];
     backward(parameters.map, _input, dL_dr, _input_grad);
 }
+
+BACKWARD_USING_OUTPUT { // Internal map could make advantage of precomputed output
+    float dL_dr[1];
+    dL_dr[0] = 0.0;
+    [[unroll]]
+    for (int i=0; i<OUTPUT_DIM; i++)
+        dL_dr[0] += _output_grad[i];
+    backward(parameters.map, _input, float[1](_output[0]), dL_dr, _input_grad);
+}
 """
     )
 
     def __init__(self, map: MapBase, dim: int):
+        assert map.output_dim == 1, 'Promotion is only valid for single valued maps'
         super(PromoteMap, self).__init__(INPUT_DIM=map.input_dim, OUTPUT_DIM=dim)
         object.__setattr__(self, 'dim', dim)
         self.map = map
-        assert map.output_dim == 1, 'Promotion is only valid for single valued maps'
 
     def forward_torch(self, *args):
         t = self.map.forward_torch(*args)
@@ -1659,6 +1736,7 @@ class ConstantMap(MapBase):
         parameters=dict(
             value=ParameterDescriptor
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
 FORWARD {
     float_ptr data_ptr = float_ptr(parameters.value.data);
@@ -1689,6 +1767,7 @@ class ConcatMap(MapBase):
             map_a=MapBase,
             map_b=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
         code="""
     FORWARD {
         float output_a[A_OUTPUT_DIM];
@@ -1705,6 +1784,16 @@ class ConcatMap(MapBase):
         float output_b_grad[B_OUTPUT_DIM];
         [[unroll]] for (int i=0; i < B_OUTPUT_DIM; i++) output_b_grad[i] = _output_grad[i + A_OUTPUT_DIM];
         backward(parameters.map_b, _input, output_b_grad, _input_grad);
+    }
+    BACKWARD_USING_OUTPUT {
+        float output_a_grad[A_OUTPUT_DIM];
+        float output_a[A_OUTPUT_DIM];
+        [[unroll]] for (int i=0; i < A_OUTPUT_DIM; i++) { output_a_grad[i] = _output_grad[i]; output_a[i] = _output[i] }
+        backward(parameters.map_a, _input, output_a, output_a_grad, _input_grad);
+        float output_b_grad[B_OUTPUT_DIM];
+        float output_b[B_OUTPUT_DIM];
+        [[unroll]] for (int i=0; i < B_OUTPUT_DIM; i++) { output_b_grad[i] = _output_grad[i + A_OUTPUT_DIM]; output_b[i] = _output[i + A_OUTPUT_DIM] }
+        backward(parameters.map_b, _input, output_b, output_b_grad, _input_grad);
     }
     """
     )
@@ -1727,6 +1816,7 @@ class IndexMap(MapBase):
             map=MapBase,
             indices=[32, int]
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
         FORWARD {
             float output_map[MAP_OUTPUT_DIM];
@@ -1765,8 +1855,7 @@ class SelectMap(MapBase):
             [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _output[i] = _input[parameters.indices[i]];
         }
         BACKWARD {
-            [[unroll]] for (int i=0; i < INPUT_DIM; i++) _input_grad[i] = 0.0;
-            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _input_grad[parameters.indices[i]] = _output_grad[i];
+            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _input_grad[parameters.indices[i]] += _output_grad[i];
         }
         """
     )
@@ -1797,7 +1886,6 @@ class CameraSensor(SensorsBase):
             znear=float
         ),
         generics=dict(OUTPUT_DIM=6),
-        nodiff=True,
         code=f"""
 FORWARD
 {{
@@ -1876,7 +1964,6 @@ class Grid3DSensor(SensorsBase):
             sd=float
         ),
         generics=dict(OUTPUT_DIM=3),
-        nodiff=True,
         code=f"""
 FORWARD
 {{
@@ -1919,7 +2006,6 @@ class Box3DSensor(SensorsBase):
             box_max=vec3
         ),
         generics=dict(OUTPUT_DIM=3),
-        nodiff=True,
         code=f"""
 FORWARD
 {{
@@ -1947,7 +2033,6 @@ FORWARD {
         _output[i] = (_input[i] * parameters.alpha + _input[i]) * parameters.alpha;
 }               
         """,
-        nodiff=True,
         use_raycast=False,
     )
     
@@ -1968,7 +2053,6 @@ class Grid2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        nodiff=True,
         code="""
 FORWARD
 {
@@ -2025,7 +2109,6 @@ class Image2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        nodiff=True,
         code="""
 FORWARD
 {
@@ -2083,6 +2166,7 @@ class Grid3D(MapBase):
             bmin=vec3,
             inv_bsize=vec3
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
         
 void blend(map_object, inout float dst[OUTPUT_DIM], float_ptr src, float alpha)
@@ -2208,7 +2292,6 @@ class Transformed3DMap(MapBase):
             inverse_transform=mat4
         ),
         generics=dict(INPUT_DIM=3),
-        nodiff=True,
         code = f"""
     FORWARD {{
         vec4 x = vec4(_input[0], _input[1], _input[2], 1.0);
@@ -2248,7 +2331,6 @@ FORWARD
 #endif
 }
 """,
-        nodiff=True,
     )
 
     def __init__(self, ray_input: bool = False):
@@ -2267,6 +2349,50 @@ FORWARD
         return torch.cat([a, b], dim=-1)
 
 
+class OctProjection(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+        ),
+        generics=dict(
+            OUTPUT_DIM=2
+        ),
+        code = """
+FORWARD
+{
+#if INPUT_DIM == 3
+    vec3 w = vec3(_input[0], _input[1], _input[2]);
+#else
+    vec3 w = vec3(_input[0], _input[1], _input[2]);
+#endif
+    vec2 c = dir2oct(w);
+    _output = float[2](c.x, c.y);
+}
+""",
+    )
+
+    def __init__(self, ray_input: bool = False):
+        super().__init__(INPUT_DIM=6 if ray_input else 3)
+
+
+class OctInvProjection(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+        ),
+        generics=dict(
+            INPUT_DIM=2,
+            OUTPUT_DIM=3
+        ),
+        code = """
+FORWARD
+{
+    vec2 c = vec2(_input[0], _input[1]);
+    vec3 w = oct2dir(c);
+    _output = float[3](w.x, w.y, w.z);
+}
+""",
+    )
+
+
 class UniformRandom(MapBase):
     __extension_info__ = dict(
         parameters=dict(
@@ -2277,7 +2403,7 @@ class UniformRandom(MapBase):
             [[unroll]] for (int i=0; i<OUTPUT_DIM - 1; i++) _output[i] = random();
             _output[OUTPUT_DIM-1] = 1.0;
         }
-                """, nodiff=True
+                """,
     )
 
     def __init__(self, input_dim, point_dim):
@@ -2307,7 +2433,7 @@ FORWARD
     }
     _output[OUTPUT_DIM-1] = pow(two_pi, 0.5 * (OUTPUT_DIM-1)) * exp (0.5 * sum); // 1 / pdf(x)
 }
-                    """, nodiff=True
+                    """,
     )
 
     def __init__(self, input_dim, output_dim):
@@ -2325,7 +2451,7 @@ class UniformRandomDirection(MapBase):
         vec3 w_out = randomDirection();
         _output = float[4](w_out.x, w_out.y, w_out.z, 4 * pi);
     }
-            """, nodiff=True
+            """,
     )
 
     def __init__(self, input_dim):
@@ -2381,7 +2507,7 @@ class XRQuadtreeRandomDirection(MapBase):
         vec3 w_out = randomDirection((p0.x * 2 - 1) * pi, (p1.x * 2 - 1) * pi, p0.y * pi, p1.y * pi);
         _output = float[4](w_out.x, w_out.y, w_out.z, weight);
     }
-            """, nodiff=True
+            """,
     )
 
     def __init__(self, input_dim: int, densities: torch.Tensor, levels: int):
@@ -2412,7 +2538,7 @@ FORWARD
     [[unroll]] for (int i = 0; i<FUNCTION_OUTPUT_DIM; i++) _output[i] = function_out[i] * wx;
     [[unroll]] for (int i = 0; i<FUNCTION_INPUT_DIM; i++) _output[i + FUNCTION_OUTPUT_DIM] = function_in[i];
 }
-        """, nodiff=True
+        """,
     )
     def __init__(self, point_sampler: MapBase, function_map: MapBase):
         assert point_sampler.output_dim - 1 == function_map.input_dim
@@ -2436,7 +2562,6 @@ class GridRatiotrackingTransmittance(MapBase):
             boundary=MapBase
         ),
         path=__INCLUDE_PATH__ + "/maps/transmittance_grt.h",
-        nodiff=True
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
@@ -2458,7 +2583,6 @@ class GridDeltatrackingTransmittance(MapBase):
             boundary=MapBase
         ),
         path=__INCLUDE_PATH__ + "/maps/transmittance_gdt.h",
-        nodiff=True
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
@@ -2480,7 +2604,7 @@ class GridDDATransmittance(MapBase):
             boundary=MapBase
         ),
         path=__INCLUDE_PATH__ + "/maps/transmittance_dda.h",
-        # nodiff=True
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
@@ -2497,6 +2621,7 @@ class RatiotrackingTransmittance(MapBase):
         path=__INCLUDE_PATH__ + "/maps/transmittance_rt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, sigma: MapBase, boundary: MapBase, majorant: MapBase):
@@ -2511,6 +2636,7 @@ class DeltatrackingTransmittance(MapBase):
         path=__INCLUDE_PATH__ + "/maps/transmittance_dt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, sigma: MapBase, boundary: MapBase, majorant: MapBase):
@@ -2525,7 +2651,6 @@ class RaymarchingTransmittance(MapBase):
         path=__INCLUDE_PATH__ + "/maps/transmittance_rm.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, step=float),
-        nodiff=True
     )
 
     def __init__(self, sigma: MapBase, boundary: MapBase, step: float = 0.005):
@@ -2540,6 +2665,7 @@ class DeltatrackingCollisionSampler(MapBase):
         path=__INCLUDE_PATH__ + "/maps/collision_sampler_dt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase, ds_epsilon=float),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, sigma: MapBase, boundary: MapBase, majorant: MapBase, ds_epsilon:float):
@@ -2555,6 +2681,7 @@ class MCScatteredRadiance(MapBase):
         path=__INCLUDE_PATH__ + "/maps/scattered_radiance_mc.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(scattering_albedo=MapBase, phase_sampler=MapBase, radiance=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, scattering_albedo: MapBase, phase_sampler: MapBase, radiance: MapBase):
@@ -2569,6 +2696,7 @@ class MCScatteredEmittedRadiance(MapBase):
         path=__INCLUDE_PATH__ + "/maps/scattered_emitted_radiance_mc.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(scattering_albedo=MapBase, emission=MapBase, phase_sampler=MapBase, radiance=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, scattering_albedo: MapBase, emission: MapBase, phase_sampler: MapBase, radiance: MapBase):
@@ -2592,6 +2720,7 @@ class MCCollisionIntegrator(MapBase):
         path=__INCLUDE_PATH__ + '/maps/collision_integrator_mc.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(collision_sampler=MapBase, exitance_radiance=MapBase, environment=MapBase),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, collision_sampler: MapBase, exitance_radiance: MapBase, environment: MapBase):
@@ -2621,6 +2750,7 @@ class GridDDACollisionIntegrator(MapBase):
             box_min=vec3,
             box_max=vec3
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, sigma_grid: Grid3D, exitance_radiance: MapBase, environment: MapBase, boundary: MapBase):
@@ -2648,6 +2778,7 @@ class DeltatrackingPathIntegrator(MapBase):
             majorant=MapBase,
             ds_epsilon=float
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2688,6 +2819,7 @@ class DeltatrackingNEEPathIntegrator(MapBase):
             transmittance=MapBase,
             ds_epsilon=float
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2733,6 +2865,7 @@ class DRTPathIntegrator(MapBase):
             majorant=MapBase,
             transmittance=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2776,6 +2909,7 @@ class DRTQPathIntegrator(MapBase):
             majorant=MapBase,
             transmittance=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2821,6 +2955,7 @@ class DRTDSPathIntegrator(MapBase):
             transmittance=MapBase,
             ds_epsilon=float
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2867,6 +3002,7 @@ class SPSPathIntegrator(MapBase):
             majorant=MapBase,
             transmittance=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self,
@@ -2894,7 +3030,6 @@ class SPSPathIntegrator(MapBase):
         self.transmittance = transmittance
 
 
-
 # --------------------
 
 
@@ -2914,7 +3049,6 @@ FORWARD
         _output[i] = _input[3 + i];
 }
 """,
-        nodiff=True,
     )
 
     def __init__(self):
@@ -2941,7 +3075,6 @@ FORWARD
         _output[i] = _input[i];
 }
 """,
-        nodiff=True,
     )
 
     def __init__(self):
@@ -2974,7 +3107,6 @@ class RayToSegment(MapBase):
             _output[i+3] = _input[i+3]*d[0] + _input[i]; // x1 = x + w*d
     }
     """,
-        nodiff=True,
     )
 
     def __init__(self, distance_field: 'MapBase'):
@@ -3034,7 +3166,6 @@ FORWARD
         _output[i] /= samples;
 }
         """,
-        nodiff=True,
     )
 
     def __init__(self, map: 'MapBase', step: float = 0.005):
@@ -3075,7 +3206,6 @@ class TransmittanceDT(MapBase):
         _output[0] = 0.0;
     }
             """,
-        nodiff=True,
     )
 
     def __init__(self, sigma: 'MapBase', majorant: float):
@@ -3113,7 +3243,6 @@ class TransmittanceRT(MapBase):
         _output[0] = T;
     }
             """,
-        nodiff=True,
     )
 
     def __init__(self, sigma: 'MapBase', majorant: float):
@@ -3128,6 +3257,7 @@ class TotalVariation(MapBase):
             map=MapBase,
             expected_dx=float
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
     // Total Variation - input: x, output: (map(x + dx * random_w) - map(x))/dx
     FORWARD
@@ -3198,6 +3328,7 @@ class TransmittanceFromTau(MapBase):
             tau=MapBase
         ),
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
     FORWARD
     {
@@ -3230,6 +3361,7 @@ class Grid3DLineIntegral(MapBase):
             box_max=vec3
         ),
         generics=dict(INPUT_DIM=6),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
 
 void load_tensor_at(map_object, ivec3 cell, out float[OUTPUT_DIM] values)
@@ -3554,7 +3686,7 @@ FORWARD
         _output[i] += T * radiance_values[i];
 }
 
-                """, nodiff=True
+                """
     )
 
     def __init__(self, grid_model: Grid3D, out_radiance: MapBase, boundary_radiance: MapBase):
@@ -3693,7 +3825,7 @@ FORWARD
         _output[i] += T * radiance_values[i];
 }
 
-                """, nodiff=True
+                """
     )
 
     def __init__(self, grid_model: Grid3D, out_radiance: MapBase, boundary_radiance: MapBase):
@@ -3793,7 +3925,6 @@ class TransmittanceDDA(MapBase):
         _output[0] = T;
     }
                     """,
-        nodiff=True
     )
 
     def __init__(self, grid: torch.Tensor, box_min: vec3 = vec3(-1.0, -1.0, -1.0), box_max: vec3 = vec3(1.0, 1.0, 1.0)):
@@ -3809,6 +3940,7 @@ class SH_PDF(MapBase):
         parameters=dict(
             coefficients=MapBase
         ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code="""
     FORWARD
     {
@@ -3852,8 +3984,7 @@ class SH_PDF(MapBase):
         for (int i=0; i<3; i++)
             _input_grad[i] += dL_dx[i];
     }
-    """,
-        nodiff=False,
+    """
     )
 
     def __init__(self, output_dim, coefficients_map: 'MapBase'):
@@ -3886,7 +4017,6 @@ FORWARD
         _output[0], _output[1]);
 }
         """,
-        nodiff=True
     )
 
     def __init__(self, box_min:vec3, box_max: vec3, **kwargs):
@@ -3907,6 +4037,7 @@ class VolumeRadianceIntegratorBase(MapBase):
                 **{ 'VR_'+k.upper(): 1 for k in requires }
             ),
             parameters={ **{k: MapBase for k in requires}, **parameters },
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             code = f"""
 #include "common_vr.h"
 
@@ -4190,7 +4321,7 @@ FORWARD
     float g = _g[0];    
     _output[0] = hg_phase_eval(vec3(_input[3], _input[4], _input[5]), vec3(_input[6], _input[7], _input[8]), g);
 }
-        """, nodiff=True
+        """
     )
 
     def __init__(self, phase_g: MapBase):
@@ -4213,7 +4344,7 @@ FORWARD
     vec3 w_out = hg_phase_sample(vec3(_input[3], _input[4], _input[5]), g[0]);
     _output = float[4](1.0, w_out.x, w_out.y, w_out.z);
 }
-        """, nodiff=True
+        """
     )
     def __init__(self, phase_g: MapBase):
         super(HGPhaseSampler, self).__init__()
@@ -4235,7 +4366,7 @@ FORWARD
     vec3 w_out = hg_phase_sample(w_in, g[0]);
     _output = float[4](w_out.x, w_out.y, w_out.z, 1.0/hg_phase_eval(w_in, w_out, g[0]));
 }
-        """, nodiff=True
+        """
     )
 
     def __init__(self, phase_g: MapBase):
@@ -4538,6 +4669,9 @@ def transmittance(sigma: 'MapBase', majorant: float = None, mode: Literal['dt', 
 
 def xr_projection(ray_input: bool = False):
     return XRProjection(ray_input=ray_input)
+
+def oct_inv_projection():
+    return OctInvProjection()
 
 def tsr(cls, translate: vec3 = vec3(0.0, 0.0, 0.0), scale: vec3 = vec3(1.0, 1.0, 1.0), rotatation_axis: vec3 = vec3(0.0, 1.0, 0.0), rotation_angle: float = 0.0):
     raise NotImplementedError()

@@ -2,7 +2,7 @@
 Represents objects that can scatter in surfaces.
 */
 
-void surface_scattering(map_object, vec3 wi, vec3 wo, Surfel hit, out vec3 W)
+void surface_scattering(map_object, GPUPtr scattering_map, vec3 wi, vec3 wo, Surfel hit, out vec3 W)
 {
     float _input[23] = float[23](
         wi.x, wi.y, wi.z,
@@ -15,8 +15,9 @@ void surface_scattering(map_object, vec3 wi, vec3 wo, Surfel hit, out vec3 W)
         hit.B.x, hit.B.y, hit.B.z
     );
     float _output[3];
-    forward(
-        parameters.surface_scattering,
+    dynamic_forward(
+        object,
+        scattering_map,
         _input,
         _output);
     W = vec3(_output[0], _output[1], _output[2]);

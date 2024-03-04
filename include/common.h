@@ -22,10 +22,13 @@
 
 #define FORWARD void forward(map_object, float _input[INPUT_DIM], out float _output[OUTPUT_DIM])
 #define BACKWARD void backward(map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM])
+#define BACKWARD_USING_OUTPUT void backward(map_object, float _input[INPUT_DIM], float _output[OUTPUT_DIM], float _output_grad[OUTPUT_DIM], inout float _input_grad[INPUT_DIM])
 
 #define SAVE_SEED(v) uvec4 _rdv_saved_seed_##v = get_seed();
 #define SET_SEED(v) set_seed(_rdv_saved_seed_##v);
 #define BRANCH_SEED(v) uvec4 _rdv_saved_seed_##v = create_branch_seed();
+
+#define PRINT debugPrintfEXT
 
 #define SWITCH_SEED(from_seed, to_seed) \
 _rdv_saved_seed_##from_seed = get_seed(); \
@@ -411,8 +414,14 @@ Surfel sample_surfel(in MeshInfo mesh, int index, vec2 baricentrics)
 
 void sample_surfel_bw(in MeshInfo mesh, int primitive_index, vec2 baricentrics, in Surfel surfel_grad)
 {
-
+    // TODO: backprop surfel grads to mesh parameters
 }
+
+
+#define INCLUDE_ADDITIONAL_COLLISION_VARS bool from_outside = dot(win, surfel.G) < 0;\
+    bool correct_hemisphere = (dot(win, surfel.N) < 0) == from_outside;\
+    vec3 N = correct_hemisphere ? surfel.N : surfel.G;\
+    vec3 fN = from_outside ? N : -N;
 
 
 

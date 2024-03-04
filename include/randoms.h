@@ -153,10 +153,10 @@ vec3 randomDirection(vec3 D) {
 	return t0 * x + t1 * y + D * z;
 }
 
-//vec3 randomDirection()
-//{
-//    return randomDirection(normalize(vec3(0.001, 1.013, 0.23)));
-//}
+vec3 randomDirection()
+{
+    return randomDirection(vec3(0.0, 1.0, 0.0));
+}
 
 vec3 randomDirection(vec3 D, float fov) {
 	float r1 = random();

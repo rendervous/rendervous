@@ -188,6 +188,47 @@ vec3 xr2dir(vec2 c)
 }
 
 
+// Adapted from:
+// https://gamedev.stackexchange.com/questions/169508/octahedral-impostors-octahedral-mapping
+
+vec2 dir2oct(vec3 w)
+{
+    vec3 octant = sign(w);
+    // Scale the vector so |x| + |y| + |z| = 1 (surface of octahedron).
+    float sum = dot(w, octant);
+    vec3 octahedron = w / sum;
+
+    // "Untuck" the corners using the same reflection across the diagonal as before.
+    // (A reflection is its own inverse transformation).
+    if(octahedron.z < 0) {
+        vec3 absolute = abs(octahedron);
+        octahedron.xy = octant.xy
+                      * vec2(1.0 - absolute.y, 1.0 - absolute.x);
+    }
+    return octahedron.xy;
+}
+
+vec3 oct2dir(vec2 c)
+{
+    // Unpack the 0...1 range to the -1...1 unit square.
+    vec3 w = vec3(c, 0);
+
+    // "Lift" the middle of the square to +1 z, and let it fall off linearly
+    // to z = 0 along the Manhattan metric diamond (absolute.x + absolute.y == 1),
+    // and to z = -1 at the corners where position.x and .y are both = +-1.
+    vec2 absolute = abs(w.xy);
+    w.z = 1.0 - absolute.x - absolute.y;
+
+    // "Tuck in" the corners by reflecting the xy position along the line y = 1 - x
+    // (in quadrant 1), and its mirrored image in the other quadrants.
+    if(w.z < 0)
+        w.xy = sign(w.xy)
+                    * vec2(1.0 - absolute.y, 1.0 - absolute.x);
+
+    return normalize(w);
+}
+
+
 // MORTON CODE FUNCTIONS
 // Adapted from https://gist.github.com/wontonst/8696dcfb643121c864dec7c0d6ad26c5
 

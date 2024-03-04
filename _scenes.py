@@ -3,7 +3,7 @@ import numpy as np
 from . import device, constant, mat4, mat4x3, create_density_quadtree, resample_img, Image2D, ray_direction, mat3x4, \
     ray_to_segment
 from ._maps import MapBase, parameter, ParameterDescriptor, Sampler, bind_parameter, RaycastableInfo, MeshInfo, \
-    StructModule, map_struct, ParameterDescriptorLayoutType, TensorCheck
+    StructModule, map_struct, ParameterDescriptorLayoutType, TensorCheck, BACKWARD_IMPLEMENTATIONS
 from ._internal import __INCLUDE_PATH__
 from .rendering import vec3, structured_buffer, triangle_collection, aabb_collection, ads_model, instance_buffer, \
     ads_scene, \
@@ -51,6 +51,64 @@ class Boundary(MapBase):
         raise NotImplementedError()
 
 
+class MeshBoundary(Boundary):
+    __extension_info__ = dict(
+        parameters=dict(
+            mesh_ads=torch.int64,
+        ),
+        generics=dict(
+            INPUT_DIM=6,  # x, w
+            OUTPUT_DIM=3,  # t, is_entering, patch_index
+        ),
+        code="""
+FORWARD
+{
+    // input x, w,
+    vec3 x = vec3(_input[0], _input[1], _input[2]);
+    vec3 w = vec3(_input[3], _input[4], _input[5]);
+
+    rayQueryEXT rayQuery_mesh;
+    rayQueryInitializeEXT(rayQuery_mesh,              // Ray query
+                        accelerationStructureEXT(parameters.mesh_ads),                  // Top-level acceleration structure
+                        gl_RayFlagsOpaqueEXT,  // Ray flags, here saying "treat all geometry as opaque"
+                        0xFF,                  // 8-bit instance mask, here saying "trace against all instances"
+                        x,                  // Ray origin
+                        0.0,                   // Minimum t-value
+                        w,            // Ray direction
+                        10000.0);              // Maximum t-value
+
+    while(rayQueryProceedEXT(rayQuery_mesh))
+        rayQueryConfirmIntersectionEXT(rayQuery_mesh);
+
+    int index = -1;
+    int from_outside = 0;
+    float t = 100000.0;
+    
+    if (rayQueryGetIntersectionTypeEXT(rayQuery_mesh, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+    {
+    
+        from_outside = rayQueryGetIntersectionFrontFaceEXT(rayQuery_mesh, true) ? 1 : 0;
+        index = 0;
+        t = rayQueryGetIntersectionTEXT(rayQuery_mesh, true);
+    }
+    _output = float[3](t, intBitsToFloat(from_outside), intBitsToFloat(index));
+}
+        """
+    )
+
+    def __init__(self, mesh: 'MeshGeometry'):
+        super().__init__()
+        self.mesh = mesh
+        self.mesh_ads = mesh.scene_ads.handle
+
+    def __len__(self):
+        return 1
+
+    def _pre_eval(self, include_grads: bool = False):
+        self.mesh.update_ads_if_necessary()
+        super()._pre_eval(include_grads)
+
+
 class GroupBoundary(Boundary):
     """
     Wraps a geometry to retrieve a distance map efficiently.
@@ -65,7 +123,6 @@ class GroupBoundary(Boundary):
         generics=dict(
             INPUT_DIM=6, OUTPUT_DIM=3
         ),
-        nodiff=True,
         code="""
     FORWARD
     {
@@ -97,6 +154,7 @@ class GroupBoundary(Boundary):
                     rayQueryConfirmIntersectionEXT(rayQuery);
                     // rayQueryTerminateEXT(rayQuery);
                 break;
+                #if ONLY_MESHES == 0
                 case gl_RayQueryCandidateIntersectionAABBEXT:
                     // any implicit hit is computed and cached in global surfel
                     // Get the instance (patch) hit
@@ -119,8 +177,9 @@ class GroupBoundary(Boundary):
                     }
                     rayQueryGenerateIntersectionEXT(rayQuery, current_t);
                 break;
+                #endif
             }
-        }
+        } 
         
         // check for the committed intersection to replace surfel if committed was a triangle
         if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT)
@@ -137,7 +196,7 @@ class GroupBoundary(Boundary):
 
     def __init__(self, geometry: 'GroupGeometry'):
         patches_info = geometry.per_patch_info()
-        super().__init__(len(patches_info))
+        super().__init__(len(patches_info), ONLY_MESHES=geometry.is_only_meshes)
         self.geometry = geometry
         self.group_ads = geometry.group_ads
         for i, patch in enumerate(patches_info):
@@ -145,6 +204,11 @@ class GroupBoundary(Boundary):
 
     def __len__(self):
         return len(self.geometry)
+
+    def _pre_eval(self, include_grads: bool = False):
+        self.geometry.update_ads_if_necessary()
+        super()._pre_eval(include_grads)
+
 
 
 # GEOMETRIES
@@ -274,9 +338,6 @@ class TransformedGeometry(Geometry):
         s = transform(s, T);
         surfel2array(t, patch_index, s, _output);
     }
-    
-    BACKWARD {
-    }
         """
     )
 
@@ -285,8 +346,8 @@ class TransformedGeometry(Geometry):
         self.base_geometry = base_geometry
         if initial_transform is None:
             initial_transform = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
-        self.transform = parameter(torch.nn.Parameter(initial_transform, requires_grad=True))
-        self.transform_check = TensorCheck(initial_value=initial_transform)
+        self.transform = parameter(initial_transform)
+        self.transform_check = TensorCheck(initial_value=self.transform)
 
     def per_patch_geometry(self) -> List[int]:
         return self.base_geometry.per_patch_geometry()
@@ -314,7 +375,6 @@ class MeshGeometry(Geometry):
             INPUT_DIM=6,  # x, w
             OUTPUT_DIM=16,  # t, N, G, C, T, B, patch_index
         ),
-        nodiff=True,
         code="""
 FORWARD
 {
@@ -600,6 +660,9 @@ FORWARD
     def __len__(self):
         return 1
 
+    def get_boundary(self) -> 'Boundary':
+        return MeshBoundary(self)
+
     def per_patch_geometry(self) -> List[int]:
         return self._per_patch_geometry
 
@@ -621,7 +684,6 @@ class GroupGeometry(Geometry):
             INPUT_DIM=6,  # x, w
             OUTPUT_DIM=16,  # t, N, G, C, T, B, patch_index
         ),
-        nodiff=True,
         code="""
     FORWARD
     {
@@ -653,6 +715,7 @@ class GroupGeometry(Geometry):
                     rayQueryConfirmIntersectionEXT(rayQuery);
                     //rayQueryTerminateEXT(rayQuery);
                 break;
+                #if ONLY_MESHES == 0
                 case gl_RayQueryCandidateIntersectionAABBEXT:
                     // any implicit hit is computed and cached in global surfel
 
@@ -678,6 +741,7 @@ class GroupGeometry(Geometry):
                     }
                     rayQueryGenerateIntersectionEXT(rayQuery, current_t);
                 break;
+                #endif
             }
         }
         
@@ -692,6 +756,7 @@ class GroupGeometry(Geometry):
             RaycastableInfo raycastInfo = RaycastableInfo(parameters.patches[index]);
             MeshInfo meshInfo = MeshInfo(raycastInfo.mesh_info);
             global_surfel = transform(sample_surfel(meshInfo, primitive_index, baricentrics), o2w);        
+            // global_surfel = sample_surfel(meshInfo, primitive_index, baricentrics);        
             patch_index = index;
         }
 
@@ -715,13 +780,24 @@ class GroupGeometry(Geometry):
         GroupGeometry.__GEOMETRY_ID__ += 1
         # Tag with a generic that a new geometry collection is needed to differentiate from others within nested dynamic calls
         _per_patch_infos, _per_patch_geometries = GroupGeometry._flatten_patches(geometries)
-        super().__init__(len(_per_patch_infos), RDV_GEOMETRY_ID=GroupGeometry.__GEOMETRY_ID__)
+        def all_meshes(g):
+            if isinstance(g, MeshGeometry):
+                return True
+            if isinstance(g, TransformedGeometry):
+                return all_meshes(g.base_geometry)
+            if isinstance(g, GroupGeometry):
+                return all(all_meshes(geom) for geom in g.geometries)
+            return False
+
+        is_only_meshes = 1 if all(all_meshes(geom) for geom in geometries) else 0
+        super().__init__(len(_per_patch_infos), RDV_GEOMETRY_ID=GroupGeometry.__GEOMETRY_ID__, ONLY_MESHES=is_only_meshes)
         self._per_patch_infos, self._per_patch_geometries = _per_patch_infos, _per_patch_geometries
         self._per_patch_geometries_tensor = torch.tensor(_per_patch_geometries, dtype=torch.int64).unsqueeze(-1)
         self.geometries_module_list = torch.nn.ModuleList(geometries)
         self.geometries = geometries
         for i, patch in enumerate(self._per_patch_infos):
             self.patches[i] = patch
+        self.is_only_meshes = is_only_meshes
         # Create an instance buffer for the top level objects
         self.scene_buffer = instance_buffer(len(self._per_patch_geometries), MemoryLocation.GPU)
         # Create the top level ads
@@ -731,7 +807,7 @@ class GroupGeometry(Geometry):
         self.group_ads = self.scene_ads.handle
         self.cached_transforms = torch.empty(len(self._per_patch_geometries), 3, 4)
         self.cached_transforms[:] = GroupGeometry.__identity__
-        self.update_ads_if_necessary()
+        self._update_ads()
 
     __identity__ = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]])
 
@@ -748,24 +824,26 @@ class GroupGeometry(Geometry):
             g.update_patch_transforms(transforms[offset:offset + p])
             offset += p
 
+    def _update_ads(self):
+        current_transforms = torch.empty(len(self._per_patch_geometries), 3, 4)
+        current_transforms[:] = GroupGeometry.__identity__
+        self.update_patch_transforms(current_transforms)
+        with self.scene_buffer.map('in') as s:
+            # notice that these updates are serial
+            s.flags = 0
+            s.mask = 0xFF
+            s.accelerationStructureReference = self._per_patch_geometries_tensor
+            s.transform = current_transforms
+        with raytracing_manager() as man:
+            man.build_ads(self.scene_ads, self.scratch_buffer)
+        self.cached_transforms = current_transforms
+
     def update_ads_if_necessary(self):
         any_geometry_changed = False
         for g in self.geometries:
             any_geometry_changed |= g.update_ads_if_necessary()
-        current_transforms = torch.empty(len(self._per_patch_geometries), 3, 4)
-        current_transforms[:] = GroupGeometry.__identity__
-        self.update_patch_transforms(current_transforms)
-        if any_geometry_changed or not torch.equal(current_transforms, self.cached_transforms):
-            with self.scene_buffer.map('in') as s:
-                # notice that these updates are serial
-                s.flags = 0
-                s.mask = 0xFF
-                s.accelerationStructureReference = self._per_patch_geometries_tensor
-                s.transform = current_transforms
-            with raytracing_manager() as man:
-                man.build_ads(self.scene_ads, self.scratch_buffer)
-            self.cached_transforms = current_transforms
-
+        if any_geometry_changed: # or not torch.equal(current_transforms, self.cached_transforms):
+            self._update_ads()
 
     def get_boundary(self) -> 'Boundary':
         return GroupBoundary(self)
@@ -779,36 +857,23 @@ class Environment(MapBase):
 
     @staticmethod
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None
+            path_or_code: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
+        if ',' in path_or_code:
+            code = """
+    #include "environment_interface.h"
+            """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
             parameters=parameters,
-            code=f"""
-
-        {external_code}
-
-        FORWARD {{
-            vec3 x = vec3(_input[0], _input[1], _input[2]);
-            vec3 w = vec3(_input[3], _input[4], _input[5]);
-            vec3 E;
-            {fw_code}
-            _output = float[3](E.x, E.y, E.z);
-        }}
-
-        BACKWARD {{
-            {bw_code}
-        }}
-                """
+            path=path,
+            code=code,
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
         )
 
 
@@ -817,36 +882,23 @@ class EnvironmentSamplerPDF(MapBase):
 
     @staticmethod
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None
+            path_or_code: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
+        if ',' in path_or_code:
+            code = """
+        #include "environment_sampler_pdf_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
             parameters=parameters,
-            code=f"""
-
-        {external_code}
-
-        FORWARD {{
-            vec3 x = vec3(_input[0], _input[1], _input[2]);
-            vec3 w = vec3(_input[3], _input[4], _input[5]);
-            float pdf;
-            {fw_code}
-            _output = float[1](pdf);
-        }}
-
-        BACKWARD {{
-            {bw_code}
-        }}
-                """
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE, # sampler pdfs are not differentiable
+            path=path,
+            code=code
         )
 
 
@@ -856,57 +908,50 @@ class EnvironmentSampler(MapBase):  # x -> we, E(we)/pdf(we), pdf(we)
 
     @staticmethod
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None
+            path_or_code: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
+        if ',' in path_or_code:
+            code = """
+        #include "environment_sampler_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics = dict(INPUT_DIM=3, OUTPUT_DIM=7),
             parameters = parameters,
-            code = f"""
-            
-    {external_code}
-    
-    FORWARD {{
-        vec3 x = vec3(_input[0], _input[1], _input[2]);
-        vec3 w;
-        vec3 E;
-        float pdf;
-        {fw_code}
-        _output = float[7](w.x, w.y, w.z, E.x, E.y, E.z, pdf);
-    }}
-    
-    BACKWARD {{
-        {bw_code}
-    }}
-            """
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
+            path=path,
+            code=code,
         )
 
-    def get_environment(self) -> Environment:  # x, we -> E(we)
+    def get_environment(self) -> MapBase:  # x, we -> E(we)
         raise NotImplementedError()
 
-    def get_pdf(self) -> EnvironmentSamplerPDF:   # x, we -> pdf(we)
+    def get_pdf(self) -> MapBase:   # x, we -> pdf(we)
         raise NotImplementedError()
 
 
 class XREnvironment(Environment):
     __extension_info__ = Environment.create_extension_info(
-        parameters=dict(
-            environment_img=MapBase
-        ),
-        fw_code=f"""
+        """
+    void environment(map_object, vec3 x, vec3 w, out vec3 E)
+    {
         vec2 xr = dir2xr(w);
         float[3] R;
         forward(parameters.environment_img, float[2](xr.x, xr.y), R);
         E = vec3(R[0], R[1], R[2]); 
-        """
+    }
+    void environment_bw(map_object, vec3 x, vec3 w, vec3 dL_dE)
+    {
+        vec2 xr = dir2xr(w);
+        float[3] dL_dR = float[3](dL_dE.x, dL_dE.y, dL_dE.z);
+        backward(parameters.environment_img, float[2](xr.x, xr.y), dL_dR);
+    }
+        """,
+        environment_img = MapBase
     )
     def __init__(self, environment_img: MapBase):
         super().__init__()
@@ -915,11 +960,9 @@ class XREnvironment(Environment):
 
 class XREnvironmentSamplerPDF(EnvironmentSamplerPDF):
     __extension_info__ = EnvironmentSamplerPDF.create_extension_info(
-        parameters=dict(
-            densities=torch.Tensor,  # quadtree probabilities
-            levels=int,  # Number of levels of the quadtree
-        ),
-        fw_code="""
+        """
+    void environment_sampler_pdf(map_object, vec3 x, vec3 w, out float pdf)
+    {
         // compute w converted to pixel px, py and to z-order index
         vec2 xr = dir2xr(w);
         vec2 c = xr * 0.5 + vec2(0.5); // 0,0 - 1,1
@@ -939,7 +982,10 @@ class XREnvironmentSamplerPDF(EnvironmentSamplerPDF):
         vec2 p1 = vec2(p + ivec2(1)) / (1 << parameters.levels);
         float pixel_area = 2 * pi * (cos(p0.y*pi) - cos(p1.y*pi)) / (1 << parameters.levels);
         pdf *= 1.0 / pixel_area;
-        """
+    }
+        """,
+        densities=torch.Tensor,  # quadtree probabilities
+        levels=int,  # Number of levels of the quadtree
     )
 
     def __init__(self, densities: torch.Tensor, levels: int):
@@ -950,15 +996,11 @@ class XREnvironmentSamplerPDF(EnvironmentSamplerPDF):
 
 class XREnvironmentSampler(EnvironmentSampler):
     __extension_info__ = EnvironmentSampler.create_extension_info(
-        parameters=dict(
-            environment=MapBase,  # Image with radiances
-            densities=torch.Tensor,  # quadtree probabilities
-            levels=int,  # Number of levels of the quadtree
-        ),
-        external_code="""
+        """
     #include "sc_environment.h"
-        """,
-        fw_code="""
+        
+    void environment_sampler(map_object, vec3 x, out vec3 w, out vec3 E, out float pdf)
+    {
         float_ptr densities_buf = float_ptr(parameters.densities);
         float sel = random();
         int current_node = 0;
@@ -998,7 +1040,56 @@ class XREnvironmentSampler(EnvironmentSampler):
         environment(object, x, w, E);
         E *= pixel_area / max(0.000000001, prob);
         pdf = max(0.000000001, prob) / pixel_area;
-        """)
+    }
+    
+    void environment_sampler_bw(map_object, vec3 x, vec3 out_w, vec3 out_E, vec3 dL_dw, vec3 dL_dE)
+    {  
+        // replay sampling the quadtree
+        float_ptr densities_buf = float_ptr(parameters.densities);
+        float sel = random();
+        int current_node = 0;
+        vec2 p0 = vec2(0,0);
+        vec2 p1 = vec2(1,1);
+        float prob = 1;
+        [[unroll]]
+        for (int i=0; i<parameters.levels; i++)
+        {
+            int offset = current_node * 4;
+            int selected_child = 3;
+            prob = densities_buf.data[offset + 3];
+            [[unroll]]
+            for (int c = 0; c < 3; c ++)
+                if (sel < densities_buf.data[offset + c])
+                {
+                    selected_child = c;
+                    prob = densities_buf.data[offset + c];
+                    break;
+                }
+                else
+                    sel -= densities_buf.data[offset + c];;
+            float xmed = (p1.x + p0.x)/2;
+            float ymed = (p1.y + p0.y)/2;
+            if (selected_child % 2 == 0) // left
+                p1.x = xmed;
+            else
+                p0.x = xmed;
+            if (selected_child / 2 == 0) // top
+                p1.y = ymed;
+            else
+                p0.y = ymed;
+            current_node = current_node * 4 + 1 + selected_child;
+        }
+        float pixel_area = 2 * pi * (cos(p0.y*pi) - cos(p1.y*pi)) / (1 << parameters.levels);
+        out_w = randomDirection((p0.x * 2 - 1) * pi, (p1.x * 2 - 1) * pi, p0.y * pi, p1.y * pi);
+        dL_dE *= pixel_area / max(0.000000001, prob); 
+        environment_bw(object, x, out_w, dL_dE);
+    }
+    
+        """,
+        environment=MapBase,  # Map with ray-dependent radiances
+        densities=torch.Tensor,  # quadtree probabilities
+        levels=int,  # Number of levels of the quadtree
+    )
 
     def __init__(self, environment_img: MapBase, quadtree: torch.Tensor, levels: int):
         super().__init__()
@@ -1026,6 +1117,27 @@ class XREnvironmentSampler(EnvironmentSampler):
         return XREnvironmentSampler(Image2D(environment_tensor), quadtree, levels)
 
 
+class UniformEnvironmentSampler(EnvironmentSampler):
+    __extension_info__ = EnvironmentSampler.create_extension_info(
+        """
+        #include "sc_environment.h"
+        void environment_sampler(map_object, vec3 x, out vec3 w, out vec3 E, out float pdf)
+            w = randomDirection();
+            environment(object, x, w, E);
+            pdf = .25/pi;
+        """,
+        environment=MapBase
+    )
+
+    def __init__(self, environment: MapBase):
+        super().__init__()
+        self.environment = environment
+
+    def get_pdf(self) -> EnvironmentSamplerPDF:
+        return constant(6, 0.25/np.pi)
+
+    def get_environment(self) -> MapBase:
+        return self.environment
 # class UniformEnvironmentSampler(EnvironmentSampler):
 #     __extension_info__ = EnvironmentSampler.create_extension_info("""
 #         vec3 we = randomDirection();
@@ -1046,48 +1158,23 @@ class SurfaceScattering(MapBase):  # wi, wo, P, N, G, C, T, B-> W
     __extension_info__ = None  # Abstract Node
     @staticmethod
     def create_extension_info(
-        fw_code: str,
-        bw_code: Optional[str] = None,
-        external_code: Optional[str] = None,
-        parameters: Optional[Dict] = None
+        path_or_code: str,
+        **parameters
     ):
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
-        if bw_code is None:
-            bw_code = f"""
-            """
+        if ',' in path_or_code:
+            code = """
+        #include "surface_scattering_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics=dict(INPUT_DIM=23, OUTPUT_DIM=3),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             parameters=parameters,
-            code=f"""
-{external_code}
-
-FORWARD {{
-    vec3 win = vec3(_input[0], _input[1], _input[2]);
-    vec3 wout = vec3(_input[3], _input[4], _input[5]);
-    Surfel surfel = Surfel(
-        vec3(_input[6], _input[7], _input[8]),
-        vec3(_input[9], _input[10], _input[11]),
-        vec3(_input[12], _input[13], _input[14]),
-        vec2(_input[15], _input[16]),
-        vec3(_input[17], _input[18], _input[19]),
-        vec3(_input[20], _input[21], _input[22]));
-    bool from_outside = dot(win, surfel.G) < 0;
-    bool correct_hemisphere = (dot(win, surfel.N) < 0) == from_outside;
-    vec3 N = correct_hemisphere ? surfel.N : surfel.G; 
-    vec3 fN = from_outside ? N : -N;
-    bool is_transmission = dot(wout, fN) < 0;
-    vec3 W;
-    {fw_code}
-    _output = float[3](W.x, W.y, W.z);
-}}
-
-BACKWARD {{
-    {bw_code}
-}}
-            """
+            code=code,
+            path=path,
         )
 
     @staticmethod
@@ -1102,48 +1189,23 @@ class SurfaceScatteringSamplerPDF(MapBase):  # wi, wo, P, N, G, C, T, B-> pdf(wo
     __extension_info__ = None  # Abstract Node
     @staticmethod
     def create_extension_info(
-        fw_code: str,
-        bw_code: Optional[str] = None,
-        external_code: Optional[str] = None,
-        parameters: Optional[Dict] = None
+        path_or_code: str,
+        **parameters
     ):
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
-        if bw_code is None:
-            bw_code = f"""
-            """
+        if ',' in path_or_code:
+            code = """
+        #include "surface_scattering_sampler_pdf_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics=dict(INPUT_DIM=23, OUTPUT_DIM=1),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
             parameters=parameters,
-            code=f"""
-{external_code}
-
-FORWARD {{
-    vec3 win = vec3(_input[0], _input[1], _input[2]);
-    vec3 wout = vec3(_input[3], _input[4], _input[5]);
-    Surfel surfel = Surfel(
-        vec3(_input[6], _input[7], _input[8]),
-        vec3(_input[9], _input[10], _input[11]),
-        vec3(_input[12], _input[13], _input[14]),
-        vec2(_input[15], _input[16]),
-        vec3(_input[17], _input[18], _input[19]),
-        vec3(_input[20], _input[21], _input[22]));
-    bool from_outside = dot(win, surfel.G) < 0;
-    bool correct_hemisphere = (dot(win, surfel.N) < 0) == from_outside;
-    vec3 N = correct_hemisphere ? surfel.N : surfel.G; 
-    vec3 fN = from_outside ? N : -N;
-    bool is_transmission = dot(wout, fN) < 0;
-    float pdf;
-    {fw_code}
-    _output[0] = pdf;
-}}
-
-BACKWARD {{
-    {bw_code}
-}}
-            """
+            code=code,
+            path=path
         )
 
     @staticmethod
@@ -1155,91 +1217,84 @@ class SurfaceScatteringSampler(MapBase):  # win, N, C, P, T, B -> wout, W/pdf(wo
     __extension_info__ = None  # Abstract Node
     @staticmethod
     def create_extension_info(
-        fw_code: str,
-        bw_code: Optional[str] = None,
-        external_code: Optional[str] = None,
-        parameters: Optional[Dict] = None
+        path_or_code: str,
+        **parameters
     ):
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
-        if bw_code is None:
-            bw_code = ''
+        if ',' in path_or_code:
+            code = """
+        #include "surface_scattering_sampler_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             generics=dict(INPUT_DIM=20, OUTPUT_DIM=7),
             parameters=parameters,
-            code=f"""
-{external_code}
-
-FORWARD {{
-    vec3 win = vec3(_input[0], _input[1], _input[2]);
-    Surfel surfel = Surfel(
-        vec3(_input[3], _input[4], _input[5]),
-        vec3(_input[6], _input[7], _input[8]),
-        vec3(_input[9], _input[10], _input[11]),
-        vec2(_input[12], _input[13]),
-        vec3(_input[14], _input[15], _input[16]),
-        vec3(_input[17], _input[18], _input[19]));
-    bool from_outside = dot(win, surfel.G) < 0;
-    bool correct_hemisphere = (dot(win, surfel.N) < 0) == from_outside;
-    vec3 N = correct_hemisphere ? surfel.N : surfel.G; 
-    vec3 fN = from_outside ? N : -N;
-    vec3 wout = vec3(0.0);
-    vec3 W = vec3(0.0);
-    float pdf = 0.0;
-    {fw_code}
-    _output = float[7](wout.x, wout.y, wout.z, W.x, W.y, W.z, pdf);
-}}
-
-BACKWARD {{
-    {bw_code}
-}}
-            """
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
+            code=code,
+            path=path,
         )
 
     @staticmethod
     def signature():
         return (20, 7)
 
-    def get_scattering(self):
+    def get_scattering(self) -> Union[MapBase, SurfaceScattering]:
         raise NotImplementedError()
 
-    def get_pdf(self):
+    def get_pdf(self) -> Union[MapBase, SurfaceScatteringSamplerPDF]:
         raise NotImplementedError()
 
 
 class LambertSurfaceScattering(SurfaceScattering, Singleton):
     __extension_info__ = SurfaceScattering.create_extension_info(
         f"""
-    float cosine_theta = dot(wout, fN);
-    W = vec3(is_transmission ? 0.0 : cosine_theta / pi);
+    void surface_scattering(map_object, vec3 win, vec3 wout, Surfel surfel, out vec3 W) {{
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        float cosine_theta = dot(wout, fN);
+        W = vec3(cosine_theta <= 0 ? 0.0 : cosine_theta / pi);
+    }}
+    void surface_scattering_bw(map_object, vec3 win, vec3 wout, Surfel surfel, vec3 dL_dW) {{
+    }}
         """
     )
 
 
 class LambertSurfaceScatteringSamplerPDF(SurfaceScatteringSamplerPDF, Singleton):
     __extension_info__ = SurfaceScatteringSamplerPDF.create_extension_info(f"""
-    float cosine_theta = dot(wout, fN);
-    pdf = is_transmission ? 0.0 : cosine_theta / pi;
+    void surface_scattering_sampler_pdf(map_object, vec3 win, vec3 wout, Surfel surfel, out float pdf) {{
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        float cosine_theta = dot(wout, fN);
+        pdf = cosine_theta <= 0 ? 0.0 : cosine_theta / pi;
+    }}
     """)
 
 
 class LambertSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
     __extension_info__ = SurfaceScatteringSampler.create_extension_info(
         f"""
-    float cosine_theta;
-    if (!from_outside)
+    void surface_scattering_sampler(map_object, vec3 win, Surfel surfel, out vec3 wout, out vec3 W, out float pdf)
     {{
-        wout = vec3(0.0);
-        pdf = 0.0;
-        W = vec3(0.0);
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        float cosine_theta;
+        if (!from_outside)
+        {{
+            wout = vec3(0.0);
+            pdf = 0.0;
+            W = vec3(0.0);
+        }}
+        else {{
+            wout = randomHSDirectionCosineWeighted(fN, cosine_theta);
+            pdf = cosine_theta / pi;
+            W = vec3(1.0);
+        }}
     }}
-    else {{
-        wout = randomHSDirectionCosineWeighted(fN, cosine_theta);
-        pdf = cosine_theta / pi;
-        W = vec3(1.0);
-    }}
+    
+    void surface_scattering_sampler_bw(map_object, vec3 win, Surfel surfel, vec3 out_wout, vec3 out_W, vec3 dL_dwout, vec3 dL_dW)
+    {{
+        // TODO: Implement backward here!
+    }}    
         """
     )
 
@@ -1251,39 +1306,55 @@ class LambertSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
 
 
 class DeltaSurfaceScattering(SurfaceScattering, Singleton):
-    __extension_info__ = SurfaceScattering.create_extension_info(f"""
-    W = vec3(0.0);
-    """)
+    __extension_info__ = dict(
+        generics=dict(INPUT_DIM=23, OUTPUT_DIM=3),
+        code="""
+    FORWARD {
+        _output = float[3] (0.0, 0.0, 0.0);
+    }
+        """,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
+    )
 
 
 class DeltaSurfaceScatteringPDF(SurfaceScatteringSamplerPDF, Singleton):
-    __extension_info__ = SurfaceScatteringSamplerPDF.create_extension_info(f"""
-    pdf = 0.0;
-    """)
+    __extension_info__ = dict(
+        generics=dict(INPUT_DIM=23, OUTPUT_DIM=1),
+        code="""
+        FORWARD {
+            _output = float[1] (0.0);
+        }
+            """,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
+    )
 
 
 class FresnelSurfaceScatteringSampler(SurfaceScatteringSampler):
     __extension_info__ = SurfaceScatteringSampler.create_extension_info(f"""
-    vec3 reflect_w = reflect(win, fN);
-    float eta = from_outside ? 1 / parameters.refraction_index : parameters.refraction_index;
-    vec3 refract_w = refract(win, fN, eta);
-    
-    float theta = abs(dot(win, fN));
-    float f = pow((1 - eta)/(1 + eta), 2);
-    float R = f + (1 - f) * pow(1 - theta, 5);
-    
-    if (refract_w == vec3(0.0) || random() < R) {{
-        wout = reflect_w;
+    void surface_scattering_sampler(map_object, vec3 win, Surfel surfel, out vec3 wout, out vec3 W, out float pdf)
+    {{
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        vec3 reflect_w = reflect(win, fN);
+        float eta = from_outside ? 1 / parameters.refraction_index : parameters.refraction_index;
+        vec3 refract_w = refract(win, fN, eta);
+        float theta = abs(dot(win, fN));
+        float f = pow((1 - eta)/(1 + eta), 2);
+        float R = f + (1 - f) * pow(1 - theta, 5);
+        if (refract_w == vec3(0.0) || random() < R) {{
+            wout = reflect_w;
+        }}
+        else {{
+            wout = refract_w;
+        }}
+        W = vec3(1.0/(eta*eta));
+        pdf = -1.0;
     }}
-    else {{
-        wout = refract_w;
+    
+    void surface_scattering_sampler_bw(map_object, vec3 win, Surfel surfel, vec3 out_wout, vec3 out_W, vec3 dL_dwout, vec3 dL_dW)
+    {{
     }}
-    W = vec3(1.0/(eta*eta));
-    pdf = -1.0;
     """,
-    parameters=dict(
-        refraction_index=float
-    )
+    refraction_index=float
     )
 
     def __init__(self, refraction_index: float = 1.5):
@@ -1299,9 +1370,17 @@ class FresnelSurfaceScatteringSampler(SurfaceScatteringSampler):
 
 class MirrorSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
     __extension_info__ = SurfaceScatteringSampler.create_extension_info(f"""
-    wout = reflect(win, fN);
-    W = vec3(1.0);
-    pdf = -1.0;
+    void surface_scattering_sampler(map_object, vec3 win, Surfel surfel, out vec3 wout, out vec3 W, out float pdf)
+    {{
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        wout = reflect(win, fN);
+        W = vec3(1.0);
+        pdf = -1.0;
+    }}
+    
+    void surface_scattering_sampler_bw(map_object, vec3 win, Surfel surfel, vec3 out_wout, vec3 out_W, vec3 dL_dwout, vec3 dL_dW)
+    {{
+    }}
     """)
 
     def get_scattering(self):
@@ -1313,34 +1392,42 @@ class MirrorSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
 
 class SpectralFresnelSurfaceScatteringSampler(SurfaceScatteringSampler):
     __extension_info__ = SurfaceScatteringSampler.create_extension_info(f"""
-    vec3 reflect_w = reflect(win, fN);
-    float spectral_alpha = random() * 6;
-    int index = int(spectral_alpha);
-    float refraction_index = parameters.refraction_index*(1 + 0.01*spectral_alpha);
-    vec3 colors [6] = {{ 
-        vec3(3.0, 0.0, 0.0), 
-        vec3(1.5, 1.5, 0.0),
-        vec3(0.0, 3.0, 0.0),
-        vec3(0.0, 1.5, 1.5),
-        vec3(0.0, 0.0, 3.0), 
-        vec3(1.5, 0.0, 1.5)
-    }};
-    vec3 Cr = colors[index];
-    float eta = from_outside ? 1/refraction_index : refraction_index;
-    vec3 refract_w = refract(win, fN, eta);
-
-    float theta = -dot(win, fN);
-    float f = pow((1 - 1/refraction_index)/(1 + 1/refraction_index), 2);
-    float R = f + (1 - f) * pow(1 - theta, 5);
-
-    if (refract_w == vec3(0.0) || random() < R) {{
-        wout = reflect_w;
-    }}
-    else {{
-        wout = refract_w;
-    }}
-    W = Cr / vec3(eta*eta);
+    void surface_scattering_sampler(map_object, vec3 win, Surfel surfel, out vec3 wout, out vec3 W, out float pdf)
+    {{
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        vec3 reflect_w = reflect(win, fN);
+        float spectral_alpha = random() * 6;
+        int index = int(spectral_alpha);
+        float refraction_index = parameters.refraction_index*(1 + 0.01*spectral_alpha);
+        vec3 colors [6] = {{ 
+            vec3(3.0, 0.0, 0.0), 
+            vec3(1.5, 1.5, 0.0),
+            vec3(0.0, 3.0, 0.0),
+            vec3(0.0, 1.5, 1.5),
+            vec3(0.0, 0.0, 3.0), 
+            vec3(1.5, 0.0, 1.5)
+        }};
+        vec3 Cr = colors[index];
+        float eta = from_outside ? 1/refraction_index : refraction_index;
+        vec3 refract_w = refract(win, fN, eta);
     
+        float theta = -dot(win, fN);
+        float f = pow((1 - 1/refraction_index)/(1 + 1/refraction_index), 2);
+        float R = f + (1 - f) * pow(1 - theta, 5);
+    
+        if (refract_w == vec3(0.0) || random() < R) {{
+            wout = reflect_w;
+        }}
+        else {{
+            wout = refract_w;
+        }}
+        W = Cr / vec3(eta*eta);
+        pdf = -1.0;
+    }}
+    
+    void surface_scattering_sampler_bw(map_object, vec3 win, Surfel surfel, vec3 out_wout, vec3 out_W, vec3 dL_dwout, vec3 dL_dW)
+    {{
+    }}
     """,
                                                                         parameters=dict(
                                                                             refraction_index=float
@@ -1365,6 +1452,7 @@ class AlbedoSurfaceScattering(SurfaceScattering):
             albedo=MapBase,
         ),
         generics=dict(INPUT_DIM=23, OUTPUT_DIM=3),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         code=f"""
     FORWARD {{
         forward(parameters.base_scattering, _input, _output);
@@ -1381,8 +1469,35 @@ class AlbedoSurfaceScattering(SurfaceScattering):
         _output[1] *= albedo[1];
         _output[2] *= albedo[2];
     }}
-        """,
-        nodiff=True
+    
+    BACKWARD {{
+        float _output_scattering[3];
+        forward(parameters.base_scattering, _input, _output_scattering);
+        float[3] albedo;
+    #if ALBEDO_MAP_DIM == 2
+        float[2] C = float[2](_input[15],_input[16]);
+        forward(parameters.albedo, C, albedo);
+    #endif
+    #if ALBEDO_MAP_DIM == 3
+        float[3] P = float[3](_input[6], _input[7], _input[8]);
+        forward(parameters.albedo, P, albedo);
+    #endif
+        float _grad[3];
+        _grad = float[3](_output_grad[0] * albedo[0], _output_grad[1] * albedo[1], _output_grad[2] * albedo[2]);
+        backward(parameters.base_scattering, _input, _output_scattering, _grad, _input_grad);
+        _grad = float[3](_output_grad[0] * _output_scattering[0], _output_grad[1] * _output_scattering[1], _output_grad[2] * _output_scattering[2]);
+    #if ALBEDO_MAP_DIM == 2
+        float[2] C_grad;
+        backward(parameters.albedo, C, albedo, _grad, C_grad);
+        // TODO: From C_grad to _input_grad
+    #endif
+    #if ALBEDO_MAP_DIM == 3
+        float[3] P_grad;
+        backward(parameters.albedo, P, albedo, _grad, P_grad);
+        // TODO: From P_grad to _input_grad
+    #endif
+    }}
+        """
     )
 
     def __init__(self, base: SurfaceScattering, albedo: MapBase):
@@ -1400,12 +1515,12 @@ class AlbedoSurfaceScatteringSampler(SurfaceScatteringSampler):
             albedo=MapBase
         ),
         generics=dict(INPUT_DIM=20, OUTPUT_DIM=7),
-        nodiff=True,
+        bw_implementations = BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         forward(parameters.base_scattering_sampler, _input, _output);
         float[3] albedo;
-        #if ALBEDO_MAP_DIM == 2
+    #if ALBEDO_MAP_DIM == 2
         float[2] C = float[2](_input[12],_input[13]);
         forward(parameters.albedo, C, albedo);
     #endif
@@ -1442,7 +1557,7 @@ class MixtureSurfaceScatter(SurfaceScattering):
             alpha=MapBase
         ),
         generics=dict(INPUT_DIM=23, OUTPUT_DIM=3),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         float alpha[1];
@@ -1479,7 +1594,7 @@ class MixtureSurfaceScatterSamplerPDF(SurfaceScatteringSamplerPDF):
             alpha=MapBase
         ),
         generics=dict(INPUT_DIM=23, OUTPUT_DIM=1),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         float alpha[1];
@@ -1516,7 +1631,7 @@ class MixtureSurfaceScatteringSampler(SurfaceScatteringSampler):
             alpha=MapBase
         ),
         generics=dict(INPUT_DIM=20, OUTPUT_DIM=7),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
         FORWARD {{
             float alpha[1];
@@ -1561,7 +1676,7 @@ class MixtureSurfaceScatteringSampler(SurfaceScatteringSampler):
 class NullSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
     __extension_info__ = dict(
         generics=dict(INPUT_DIM=20, OUTPUT_DIM=7),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         _output = float[7](_input[0], _input[1], _input[2], 1.0, 1.0, 1.0, -1.0);
@@ -1578,7 +1693,7 @@ class NullSurfaceScatteringSampler(SurfaceScatteringSampler, Singleton):
 class NoSurfaceScatteringSampler(SurfaceScatteringSampler):
     __extension_info__ = dict(
         generics=dict(INPUT_DIM=20, OUTPUT_DIM=7),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         _output = float[7](0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -1612,6 +1727,7 @@ class SurfaceEmission(MapBase):
         return dict(
             generics=dict(INPUT_DIM=20, OUTPUT_DIM=3),
             parameters=parameters,
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
             code = f"""
 {external_code if external_code is not None else ''}
 
@@ -1631,10 +1747,6 @@ FORWARD {{
     vec3 E;
     {fw_code}
     _output = float[3](E.x, E.y, E.z); 
-}}
-
-BACKWARD {{
-    
 }}
             """,
 
@@ -1690,7 +1802,7 @@ class LambertSurfaceEmission(SurfaceEmission):
 class NoSurfaceEmission(SurfaceEmission):
     __extension_info__ = dict(
         generics=dict(INPUT_DIM=20, OUTPUT_DIM=3),
-        nodiff=True,
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
         code=f"""
     FORWARD {{
         _output = float[3](0.0, 0.0, 0.0);
@@ -1711,46 +1823,23 @@ class SurfaceGathering(MapBase): # win, P, N, G, C, T, B -> R
 
     @staticmethod
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None, **kwargs
+            path_or_code: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters  = {}
-        if external_code is None:
-            external_code = ''
+        if ',' in path_or_code:
+            code = """
+    #include "surface_gathering_interface.h"
+                """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             parameters=parameters,
             generics=dict(INPUT_DIM=20, OUTPUT_DIM=3),
-            code=f"""
-    {external_code}
-    
-    FORWARD {{
-        vec3 win = vec3(_input[0], _input[1], _input[2]);
-        Surfel surfel = Surfel(
-            vec3(_input[3], _input[4], _input[5]),
-            vec3(_input[6], _input[7], _input[8]),
-            vec3(_input[9], _input[10], _input[11]),
-            vec2(_input[12], _input[13]),
-            vec3(_input[14], _input[15], _input[16]),
-            vec3(_input[17], _input[18], _input[19]));
-        bool from_outside = dot(win, surfel.G) < 0;
-        bool correct_hemisphere = (dot(win, surfel.N) < 0) == from_outside;
-        vec3 N = correct_hemisphere ? surfel.N : surfel.G; 
-        vec3 fN = from_outside ? N : -N;
-        vec3 A = vec3(0.0);
-        {fw_code}
-        _output = float[3](A.x, A.y, A.z);
-    }}
-    
-    BACKWARD {{
-        {bw_code}
-    }}
-            """,
-            **kwargs
+            path=path,
+            code=code,
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT
         )
 
     @staticmethod
@@ -1759,74 +1848,63 @@ class SurfaceGathering(MapBase): # win, P, N, G, C, T, B -> R
 
 
 class NoSurfaceGathering(SurfaceGathering, Singleton):
-    __extension_info__ = {
-        **SurfaceGathering.create_extension_info(''),
-        'code': f"""
-    FORWARD {{
+    __extension_info__ = dict(
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.NONE,
+        code = """
+    FORWARD {
         _output = float[3](0.0, 0.0, 0.0);
-    }}
-    BACKWARD {{ }}
-    """
     }
+    """
+    )
 
 
 class EnvironmentGathering(SurfaceGathering):
     __extension_info__ = SurfaceGathering.create_extension_info(
         """
+    #include "sc_environment_sampler.h"
+    #include "sc_environment.h"
+    #include "sc_surface_scattering.h"
+    #include "sc_surface_scattering_sampler.h"
+    #include "sc_visibility.h"
+
+    void surface_gathering(map_object, vec3 win, Surfel surfel, out vec3 A) {
+        INCLUDE_ADDITIONAL_COLLISION_VARS
+        A = vec3(0.0);
         // Check scattering if 
         // x, s -> w, W, pdf
-        vec3 x;
-        float[7] ss_values;
-        forward(parameters.scattering_sampler, _input, ss_values);
-
-        vec3 we = vec3(ss_values[0], ss_values[1], ss_values[2]);
-        vec3 E, W;
-        if (ss_values[6] == -1) // delta scattering
+        vec3 x; 
+        vec3 W, we; float we_pdf;
+        vec3 E;
+        surface_scattering_sampler(object, win, surfel, we, W, we_pdf);
+        if (we_pdf == -1) // delta scattering
         {
             x = surfel.P + we * 0.0001;
             environment(object, x, we, E);
-            W = vec3(ss_values[3], ss_values[4], ss_values[5]);
         }
         else 
         {
             x = fN * 0.0001 + surfel.P;
             float pdf;
             environment_sampler(object, x, we, E, pdf);
-            if (E == vec3(0)) {
-                _output = float[3](0.0, 0.0, 0.0);
-                return;
-            }
-        
-            float[3] W_values;
-            float[23] s_input = float[23](_input[0], _input[1], _input[2], we.x, we.y, we.z, 
-            _input[3], _input[4], _input[5], _input[6], _input[7], _input[8],
-             _input[9], _input[10], _input[11], 
-             _input[12], _input[13], 
-             _input[14], _input[15], _input[16],
-             _input[17], _input[18], _input[19]); 
-            forward(parameters.scattering, s_input, W_values);
-            W = vec3(W_values[0], W_values[1], W_values[2]);
-            if (W == vec3(0))
-            {
-                _output = float[3](0.0, 0.0, 0.0);
-                return;
-            }
+            surface_scattering(object, win, we, surfel, W);
         }
+        if (E == vec3(0.0) || W == vec3(0.0))
+            return;
         float Tr = ray_visibility(object, x, we); 
-        A += Tr * W * E; 
+        A = Tr * W * E;
+    }
+    
+    void surface_gathering_bw(map_object, vec3 win, Surfel surfel, vec3 out_A, vec3 dL_dA)
+    {
+        //TODO: Implement grad backprop here!
+    }
+    
         """,
-        parameters=dict(
-            environment=MapBase,
-            environment_sampler=MapBase,
-            visibility=MapBase,
-            scattering=MapBase,
-            scattering_sampler=MapBase,
-        ),
-        external_code="""
-    #include "sc_environment_sampler.h"
-    #include "sc_environment.h"
-    #include "sc_visibility.h"
-        """
+        environment=MapBase,
+        environment_sampler=MapBase,
+        visibility=MapBase,
+        surface_scattering=MapBase,
+        surface_scattering_sampler=MapBase,
     )
 
     def __init__(self, environment_sampler: EnvironmentSampler, visibility: MapBase, surface_scattering_sampler: Optional[SurfaceScatteringSampler] = None):
@@ -1834,8 +1912,8 @@ class EnvironmentGathering(SurfaceGathering):
         self.environment = environment_sampler.get_environment()
         self.environment_sampler = environment_sampler
         self.visibility = visibility
-        self.scattering = constant(23, 0.0, 0.0, 0.0) if surface_scattering_sampler is None else surface_scattering_sampler.get_scattering()
-        self.scattering_sampler = constant(20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0) if surface_scattering_sampler is None else surface_scattering_sampler
+        self.surface_scattering = constant(23, 0.0, 0.0, 0.0) if surface_scattering_sampler is None else surface_scattering_sampler.get_scattering()
+        self.surface_scattering_sampler = constant(20, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0) if surface_scattering_sampler is None else surface_scattering_sampler
 
 
 class SurfaceMaterial:
@@ -1873,74 +1951,15 @@ class MediumPathIntegrator(MapBase):
     __extension_info__ = None
     @staticmethod
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None
+            path: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters = {}
         parameters.update(dict(gathering=MapBase))
-        if external_code is None:
-            external_code = ''
-
         return dict(
             parameters = parameters,
-            # dynamics=[(6, 3)],
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
             generics = dict(INPUT_DIM=7, OUTPUT_DIM=13),
-            code=f"""
-    
-    vec3 gathering(map_object, vec3 xs, vec3 ws)
-    {{
-        float _output[3];
-        forward(parameters.gathering, float[6](xs.x, xs.y, xs.z, ws.x, ws.y, ws.z), _output);
-        return vec3(_output[0], _output[1], _output[2]); 
-    }}
-    
-    /* vec3 gathering(map_object, vec3 xs, vec3 ws)
-    {{
-        if (parameters.gathering == 0)
-        return vec3(0.0);
-
-        float _output[3];
-        dynamic_forward(object, parameters.gathering, float[6](xs.x, xs.y, xs.z, ws.x, ws.y, ws.z), _output);
-        return vec3(_output[0], _output[1], _output[2]); 
-    }}*/
-    
-    {external_code}
-    
-    FORWARD {{
-        vec3 x = vec3(_input[0], _input[1], _input[2]);
-        vec3 w = vec3(_input[3], _input[4], _input[5]);
-        float d = _input[6];
-        vec3 xo, wo;
-        float Tr = 1.0;
-        vec3 W = vec3(0.0);
-        vec3 A = vec3(0.0);
-        {fw_code}
-        /*
-        #if MEDIUM_FILTER & 1 == 0
-        W = vec3(0.0);
-        #endif 
-        #if MEDIUM_FILTER & 2 == 0
-        A = vec3(0.0);
-        #endif
-        */
-        _output = float[13](
-            Tr,
-            xo.x, xo.y, xo.z,
-            wo.x, wo.y, wo.z,
-            W.x, W.y, W.z,
-            A.x, A.y, A.z
-        );
-    }}
-    
-    BACKWARD {{
-        {bw_code}
-    }}
-            """
+            path=path
         )
 
     @staticmethod
@@ -1958,43 +1977,12 @@ class MediumPathIntegrator(MapBase):
 
 class DTMediumPathIntegrator(MediumPathIntegrator):
     __extension_info__ = MediumPathIntegrator.create_extension_info(
-        parameters=dict(
-            sigma=MapBase,
-            scattering_albedo=MapBase,
-            phase_sampler=MapBase,
-            majorant=ParameterDescriptor
-        ),
-        external_code=f"""
-    #include "vr_sigma.h"
-    #include "vr_scattering_albedo.h"
-    #include "sc_phase_sampler.h"
-        """,
-        fw_code="""
-    float majorant = max(0.00001, param_float(parameters.majorant));
-    while(true) 
-    {
-        float t = -log(1 - random()) / majorant;
-        if (t > d - 0.00001) // exit
-            break;
-        x += t * w;
-        d -= t;
-        float s = sigma(object, x);
-        if (random() < s / majorant) // interaction
-        {
-    #if MEDIUM_FILTER & 2 == 2
-            A = gathering(object, x, w);
-    #endif
-            Tr = 0.0;
-    #if MEDIUM_FILTER & 1 == 1
-            xo = x;
-            float weight, rho;
-            wo = sample_phase(object, w, weight, rho);
-            W = scattering_albedo(object, x);
-    #endif
-            break;
-        }
-    }
-    """)
+        __INCLUDE_PATH__+"/maps/medium_path_integrator_DT.h",
+        sigma=MapBase,
+        scattering_albedo=MapBase,
+        phase_sampler=MapBase,
+        majorant=ParameterDescriptor,
+    )
 
     def __init__(self, sigma: MapBase, majorant: torch.Tensor, scattering_albedo: Optional[MapBase] = None, phase_sampler: Optional[MapBase] = None, gathering: Optional[MapBase] = None, medium_filter: int = 3):
         if scattering_albedo is None or phase_sampler is None:
@@ -2008,32 +1996,36 @@ class DTMediumPathIntegrator(MediumPathIntegrator):
         self.majorant = parameter(majorant)
 
 
+class RTMediumPathIntegrator(MediumPathIntegrator):
+    __extension_info__ = MediumPathIntegrator.create_extension_info(
+        __INCLUDE_PATH__ + "/maps/medium_path_integrator_RT.h",
+        sigma=MapBase,
+        scattering_albedo=MapBase,
+        phase_sampler=MapBase,
+        majorant=ParameterDescriptor,
+    )
+
+    def __init__(self, sigma: MapBase, majorant: torch.Tensor, scattering_albedo: Optional[MapBase] = None, phase_sampler: Optional[MapBase] = None, gathering: Optional[MapBase] = None, medium_filter: int = 3):
+        if scattering_albedo is None or phase_sampler is None:
+            medium_filter &= 2
+            scattering_albedo = constant(3, 0.0, 0.0, 0.0)
+            phase_sampler = constant(3, 0.0, 0.0, 0.0, 0.0, 0.0)
+        super().__init__(gathering, medium_filter=medium_filter)
+        self.sigma = sigma
+        self.scattering_albedo = scattering_albedo
+        self.phase_sampler = phase_sampler
+        self.majorant = parameter(majorant)
+
+
+
 class HomogeneousMediumPathIntegrator(MediumPathIntegrator):
     __extension_info__ = MediumPathIntegrator.create_extension_info(
-        parameters=dict(
-            sigma=ParameterDescriptor,
-            scattering_albedo=ParameterDescriptor,
-            phase_sampler=MapBase
-        ),
-        external_code=f"""
-        #include "sc_phase_sampler.h"
-            """,
-        fw_code="""
-        float sigma = param_float(parameters.sigma);
-        Tr = exp(-d * sigma);
-        float t = -log(1 - random()*(1 - Tr)) / max(0.0000001, sigma);
-        //t = min(t, d);
-        xo = x + w * t;
-        #if MEDIUM_FILTER & 2
-        A = gathering(object, xo, w);
-        #endif
-        #if MEDIUM_FILTER & 1
-        vec3 albedo = param_vec3(parameters.scattering_albedo);
-        float weight, pdf;
-        wo = sample_phase(object, w, weight, pdf); 
-        W = albedo * weight;
-        #endif
-        """)
+        __INCLUDE_PATH__ + "/maps/medium_path_integrator_CF.h",
+        sigma=ParameterDescriptor,
+        scattering_albedo=ParameterDescriptor,
+        phase_sampler=MapBase
+    )
+
     def __init__(self, sigma: torch.Tensor, scattering_albedo: Optional[torch.Tensor] = None,
                  phase_sampler: Optional[MapBase] = None, gathering: Optional[MapBase] = None, medium_filter: int = 3):
         if scattering_albedo is None or phase_sampler is None:
@@ -2094,6 +2086,7 @@ class HomogeneousMediumPathIntegrator(MediumPathIntegrator):
 class VolumeGathering(MapBase):
     __extension_info__ = None
     @staticmethod
+
     def create_extension_info(
             fw_code: str,
             bw_code: Optional[str] = None,
@@ -2109,6 +2102,7 @@ class VolumeGathering(MapBase):
         return dict(
             parameters=parameters,
             generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             code=f"""
        {external_code}
 
@@ -2260,6 +2254,7 @@ class PhaseSamplerPDF(MapBase):
             parameters = {}
         return dict(
             parameters=parameters,
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             generics=dict(INPUT_DIM = 6, OUTPUT_DIM=1),
             code=f"""
     FORWARD {{
@@ -2286,6 +2281,7 @@ class PhaseSampler(MapBase):
             parameters = {}
         return dict(
             generics=dict(INPUT_DIM=3, OUTPUT_DIM=5),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
             parameters = parameters,
             code=f"""
     FORWARD {{
@@ -2365,7 +2361,6 @@ class HGPhaseSampler(PhaseSampler):
         return self.get_pdf()  # perfect importance sampled
 
 
-
 class MediumMaterial:
     def __init__(self, path_integrator_factory: Callable[[Optional[MapBase], int], MapBase], scattering_albedo: Optional[MapBase] = None, phase_sampler: Optional['PhaseSampler'] = None, emission: Optional[MapBase] = None, enclosed: bool = False):
         self.path_integrator_factory = path_integrator_factory
@@ -2425,11 +2420,22 @@ class HomogeneousMediumMaterial(MediumMaterial):
 
 
 class HeterogeneousMediumMaterial(MediumMaterial):
-    def __init__(self, sigma: MapBase, scattering_albedo: Optional[MapBase] = None, emission: Optional[MapBase]=None, phase_sampler: Optional['PhaseSampler'] = None, technique: Literal['dt'] = 'dt', **kwargs):
+    def __init__(self, sigma: MapBase, scattering_albedo: Optional[MapBase] = None, emission: Optional[MapBase]=None, phase_sampler: Optional['PhaseSampler'] = None, technique: Literal['dt', 'rt'] = 'dt', **kwargs):
         if technique == 'dt':
             assert 'majorant' in kwargs, "Delta tracking technique requires a majorant: torch.Tensor parameter"
             def factory(gathering, filter):
                 return DTMediumPathIntegrator(
+                    sigma=sigma,
+                    scattering_albedo=scattering_albedo,
+                    phase_sampler=phase_sampler,
+                    majorant=kwargs.get('majorant'),
+                    gathering=gathering,
+                    medium_filter=filter
+                )
+        elif technique == 'rt':
+            assert 'majorant' in kwargs, "Delta tracking technique requires a majorant: torch.Tensor parameter"
+            def factory(gathering, filter):
+                return RTMediumPathIntegrator(
                     sigma=sigma,
                     scattering_albedo=scattering_albedo,
                     phase_sampler=phase_sampler,
@@ -2445,7 +2451,6 @@ class HeterogeneousMediumMaterial(MediumMaterial):
             phase_sampler=phase_sampler,
             emission=emission
         )
-
 
 
 PTPatchInfo = map_struct(
@@ -2478,7 +2483,8 @@ class SceneVisibility(MapBase):
         dynamics=[
             MediumPathIntegrator.signature()
         ],
-        path=__INCLUDE_PATH__+'/maps/scene_visibility.h'
+        path=__INCLUDE_PATH__+'/maps/scene_visibility.h',
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
     )
     def __init__(self,
         boundaries: Boundary,
@@ -2497,7 +2503,7 @@ class SceneVisibility(MapBase):
         if surface_scatters is not None:
             for i, ss in enumerate(surface_scatters):
                 self.patch_info[i].surface_scatters = 0 if not ss else 1
-        self.media_modules = medium_integrator
+        self.media_modules = torch.nn.ModuleList(medium_integrator)
         assert inside_medium_indices is None or len(inside_medium_indices) == len(boundaries)
         if inside_medium_indices is not None:
             for i, imi in enumerate(inside_medium_indices):

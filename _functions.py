@@ -10,6 +10,31 @@ import math
 __FUNCTIONS_FOLDER__ = os.path.dirname(__file__).replace('\\', '/') + "/include/functions"
 
 
+class _oct_inv_projection(FunctionBase):
+    __extension_info__ = dict(
+        path=__FUNCTIONS_FOLDER__ + '/tools/oct_inv_projection.comp.glsl',
+        parameters = dict(
+            in_tensor = torch.int64,
+            out_tensor = torch.int64,
+        )
+    )
+
+    def bind(self, coordinates: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+        if out is None:
+            out = tensor(*coordinates.shape[:-1], 3, dtype=torch.float)
+            # out = torch.zeros(N, len(shape), dtype=torch.long)
+        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = wrap_gpu(coordinates, 'in')
+        return (math.prod(coordinates.shape[:-1]), 1, 1)
+
+    def result(self) -> torch.Tensor:
+        self.out_tensor.mark_as_dirty()
+        self.out_tensor.invalidate()
+        return self.out_tensor.obj
+
+def oct_inv_projection(coordinates: torch.Tensor, out: Optional[torch.Tensor] = None):
+    return _oct_inv_projection.eval(coordinates, out=out)
+
 def random_sphere_points(N, *, seed: int = 13, radius: float = 1.0):
     torch.manual_seed(seed)
     samples = torch.randn(N, 3)
@@ -38,6 +63,20 @@ def random_equidistant_camera_poses(N, *, seed: int = 13, radius: float = 1.0):
     camera_poses_tensor[:, 3:6] = vec3.normalize(-1*origins)
     camera_poses_tensor[:, 7] = 1.0
     return camera_poses_tensor
+
+
+def oct_camera_poses(N, *, seed: int = 13, radius: float = 1.0):
+    with torch.no_grad():
+        u = torch.arange(-1.0 + 1.0/N, 1.0, 2.0/N, device=device())
+        c = torch.cartesian_prod(u, u)
+        origins =  oct_inv_projection(c) * radius
+        # origins = random_equidistant_sphere_points(N, seed=seed, radius=radius)
+        camera_poses_tensor = torch.zeros(N*N, 9, device=device())
+        camera_poses_tensor[:, 0:3] = origins
+        camera_poses_tensor[:, 3:6] = vec3.normalize(-1*origins)
+        camera_poses_tensor[:, 7] = 1.0
+        return camera_poses_tensor
+
 
 
 class _dummy_function(FunctionBase):

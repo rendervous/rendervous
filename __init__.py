@@ -18,7 +18,7 @@ from rendervous.rendering import create_device as _create_device, external_sync,
 
 from ._internal import device
 
-_create_device(device=rdv_device, debug=True)
+_create_device(device=rdv_device, debug=False)
 
 from ._functions import *
 from ._objects import *

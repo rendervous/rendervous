@@ -43,7 +43,7 @@ def compile_shader_source(code, stage, include_dirs):
         import shlex
         p = subprocess.Popen(
             shlex.split(
-                os.path.expandvars('/usr/bin/glslang --stdin -r -V --target-env vulkan1.3 ').replace("\\",
+                os.path.expandvars('/usr/bin/glslangValidator --stdin -r -V --target-env vulkan1.3 ').replace("\\",
                                                                                                       "/")
                 + f'-S {stage} {idirs}'), stdin=subprocess.PIPE
         )

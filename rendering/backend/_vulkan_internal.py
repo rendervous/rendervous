@@ -2026,6 +2026,7 @@ class DeviceWrapper:
             VK_KHR_SWAPCHAIN_EXTENSION_NAME,
             "VK_KHR_buffer_device_address",
             "VK_EXT_shader_atomic_float",
+            "VK_KHR_shader_non_semantic_info",
             # "GLSL_EXT_ray_tracing",
             # "GLSL_EXT_ray_query",
             # "GLSL_EXT_ray_flags_primitive_culling",
@@ -2227,12 +2228,26 @@ class DeviceWrapper:
         def debug_callback(*args):
             print('DEBUG: ' + args[5] + ' ' + args[6])
             return 0
-
         debug_create = VkDebugReportCallbackCreateInfoEXT(
             sType=VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,
-            flags=VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT,
+            flags=VK_DEBUG_REPORT_INFORMATION_BIT_EXT | VK_DEBUG_REPORT_ERROR_BIT_EXT | VK_DEBUG_REPORT_WARNING_BIT_EXT,
             pfnCallback=debug_callback)
         self.__callback = self.vkCreateDebugReportCallbackEXT(self.__instance, debug_create, None)
+
+        __last_printed = ''
+        def print_debug_callback(*args):
+            nonlocal __last_printed
+            if __last_printed != args[6]:
+                print('[PRINT] ' + args[6]) #, end='\r')
+                __last_printed = args[6]
+            return 0
+        debug_create = VkDebugReportCallbackCreateInfoEXT(
+            sType=VK_STRUCTURE_TYPE_DEBUG_REPORT_CALLBACK_CREATE_INFO_EXT,
+            flags=VK_DEBUG_REPORT_INFORMATION_BIT_EXT,
+            pfnCallback=print_debug_callback)
+        self.__callback_print = self.vkCreateDebugReportCallbackEXT(self.__instance, debug_create, None)
+
+
         print('[INFO] Debug instance created...')
 
     def __createInstance(self):
@@ -2249,13 +2264,20 @@ class DeviceWrapper:
         appInfo = VkApplicationInfo(
             # sType=VK_STRUCTURE_TYPE_APPLICATION_INFO,
             pApplicationName='Rendering with Python VK',
-            applicationVersion=VK_MAKE_VERSION(1, 2, 0),
+            applicationVersion=VK_MAKE_VERSION(1, 3, 0),
             pEngineName='pyvulkan',
-            engineVersion=VK_MAKE_VERSION(1, 2, 0),
-            apiVersion=VK_MAKE_VERSION(1, 2, 0)
+            engineVersion=VK_MAKE_VERSION(1, 3, 0),
+            apiVersion=VK_MAKE_VERSION(1, 3, 0)
         )
         if self.enable_validation_layers:
+            val_feat = VkValidationFeaturesEXT(
+                enabledValidationFeatureCount=1,
+                pEnabledValidationFeatures=[
+                    VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT
+                ]
+            )
             instanceInfo = VkInstanceCreateInfo(
+                pNext=val_feat,
                 pApplicationInfo=appInfo,
                 enabledLayerCount=len(self.__layers),
                 ppEnabledLayerNames=self.__layers,
