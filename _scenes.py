@@ -2703,226 +2703,226 @@ class Scene:
         return self.visibility().after(ray_to_segment(constant(6, 10000.0))).promote(3) * self.environment_sampler.get_environment()
 
 
-class Medium(MapBase):
-    __extension_info__ = None  # Abstract Node
-    @staticmethod
-    def create_extension_info(
-        fw_code: str,
-        bw_code: Optional[str] = None,
-        external_code: Optional[str] = None,
-        parameters: Optional[Dict] = None
-    ):
-        return dict(
-            generics=dict(INPUT_DIM=7, OUTPUT_DIM=13),
-            parameters=parameters if parameters is not None else {},
-            code=f"""
-{external_code if external_code is not None else ''}
-
-FORWARD {{
-    vec3 x = vec3(_input[0], _input[1], _input[2]);
-    vec3 w = vec3(_input[3], _input[4], _input[5]);
-    float d = _input[6];
-    float Tr = 1.0;
-    vec3 xout, wout, W = vec3(0.0), A = vec3(0.0); 
-       
-    {fw_code}
-    
-    _output = float[13] (Tr, xout.x, xout.y, xout.z, wout.x, wout.y, wout.z, W.x, W.y, W.z, A.x, A.y, A.z);
-}}
-
-BACKWARD {{
-    {bw_code if bw_code is not None else ''}
-}}
-            """
-        )
-
-    def __init__(self):
-        super().__init__()  # x, w, d -> T, xe, we, W, A
-
-
-class NoMedium(Medium):
-    __extension_info__ = Medium.create_extension_info(f"""
-        Tr = 1.0; // full transmittance
-        W = vec3(0.0); // no scattering
-        A = vec3(0.0); // no accumulation
-        xout = w * d + x;
-        wout = w;
-    """)
-
-    __instance__ = None
-    @classmethod
-    def get_instance(cls):
-        if cls.__instance__ is None:
-            cls.__instance__ = NoMedium()
-        return cls.__instance__
-
-
-class HomogeneousEmissionMedium(Medium):
-    __extension_info__ = Medium.create_extension_info(
-        parameters=dict(
-            sigma=ParameterDescriptor,
-            emission=ParameterDescriptor,
-        ),
-        fw_code=f"""
-    float sigma = param_float(parameters.sigma);
-    vec3 emission = param_vec3(parameters.emission);
-    Tr = exp(-d * sigma);
-    W = vec3(0.0);
-    A = (1 - Tr) * emission; 
-    """)
-
-    def __init__(self, sigma: torch.Tensor, emission: torch.Tensor):
-        super().__init__()
-        self.sigma = parameter(sigma)
-        self.emission = parameter(emission)
-
-
-
-
-
-class HomogeneousMedium(Medium):
-    __extension_info__ = Medium.create_extension_info(
-        parameters=dict(
-            sigma=ParameterDescriptor,
-            scattering_albedo=ParameterDescriptor,
-            phase_sampler=MapBase
-        ),
-        external_code="#include \"sc_phase_sampler.h\"",
-        fw_code=f"""
-        float sigma = param_float(parameters.sigma);
-        vec3 albedo = param_vec3(parameters.scattering_albedo);
-        Tr = exp(-d * sigma);
-        float t = -log(1 - random()*(1 - Tr)) / max(0.0000001, sigma);
-        xout = x + w * t;
-        float weight, pdf;
-        wout = sample_phase(object, w, weight, pdf); 
-        W = albedo * weight;
-        """)
-
-    def __init__(self, sigma: torch.Tensor, scattering_albedo: torch.Tensor, phase_sampler: PhaseSampler):
-        super().__init__()
-        self.sigma = parameter(sigma)
-        self.scattering_albedo = parameter(scattering_albedo)
-        self.phase_sampler = phase_sampler
-
-
-class DTHeterogeneousMedium(Medium):
-    __extension_info__ = Medium.create_extension_info(
-        parameters=dict(
-            sigma=MapBase,
-            scattering_albedo=MapBase,
-            phase_sampler=MapBase,
-            majorant=ParameterDescriptor,
-        ),
-        external_code=f"""
-        #include "sc_phase_sampler.h"
-        #include "vr_sigma.h"
-        #include "vr_scattering_albedo.h"
-        """,
-        fw_code=f"""
-    float m = max(0.0001, param_float(parameters.majorant));
-    A = vec3(0.0);
-    W = vec3(0.0);
-    Tr = 1.0;
-    while (true)
-    {{
-        float t = -log(1 - random()) / m;
-        if (t > d - 0.00001)
-            break;
-        x += w * t;
-        float s = sigma(object, x); 
-        if (random() < s/m) // real interaction
-        {{
-            float weight, pdf;
-            wout = sample_phase(object, w, weight, pdf); 
-            W = scattering_albedo(object, x) * weight;
-            xout = x;
-            Tr = 0.0;
-            break;
-        }}
-        d -= t;
-    }}
-        """
-    )
-
-    def __init__(self, sigma: MapBase, scattering_albedo: MapBase, phase_sampler: MapBase, majorant: torch.Tensor):
-        super().__init__()
-        self.sigma = sigma
-        self.scattering_albedo = scattering_albedo
-        self.phase_sampler = phase_sampler
-        self.majorant = parameter(majorant)
-
-
-class EnvironmentEmission(MapBase):
-    __extension_info__ = None
-    def __init__(self):
-        super().__init__(INPUT_DIM=3, OUTPUT_DIM=3)  # w -> R
-
-
-class Pathtracer(MapBase):
-    __extension_info__ = dict(
-        parameters=dict(
-            surfaces=MapBase,  # Scene to raycast
-            environment=MapBase,  # Radiance map directional emitted from infinity
-            surface_emission=torch.Tensor,
-            surface_scattering_sampler=torch.Tensor,
-            inside_media=torch.Tensor,
-            outside_media=torch.Tensor,
-        ),
-        dynamics=[
-            (20, 3),  #surface emitters
-            (20, 7),  #surface scattering samplers
-            (7, 13),  #volume scattering
-        ],
-        generics=dict(
-            INPUT_DIM=6,  # x, w
-            OUTPUT_DIM=3,  # R
-        ),
-        path = __INCLUDE_PATH__+'/maps/scene_radiance.h'
-    )
-    
-    def __init__(self,
-                 surfaces: Geometry,
-                 environment: MapBase,
-                 surface_emission: Optional[List[MapBase]] = None,
-                 surface_scattering_sampler: Optional[List[MapBase]] = None,
-                 inside_media: List[MapBase] = None,
-                 outside_media: List[MapBase] = None,
-                 media_filter: Literal['none', 'transmitted', 'emitted', 'scattered'] = 'none'
-                 ):
-        super().__init__(surfaces.get_number_of_patches(), MEDIA_FILTER = {'none': 0, 'transmitted': 1, 'emitted': 2, 'scattered': 3}[media_filter])
-        self.surfaces = surfaces
-        self.environment = environment
-        self.sss_tensor = None if surface_scattering_sampler is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
-        self.se_tensor = None if surface_emission is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
-        self.im_tensor = None if inside_media is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
-        self.om_tensor = None if outside_media is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
-        if surface_scattering_sampler is not None:
-            for i, sss in enumerate(surface_scattering_sampler):
-                self.sss_tensor[i] = 0 if sss is None else sss.__bindable__.device_ptr
-        if surface_emission is not None:
-            for i, e in enumerate(surface_emission):
-                self.se_tensor[i] = 0 if e is None else e.__bindable__.device_ptr
-        if inside_media is not None:
-            for i, mi in enumerate(inside_media):
-                self.im_tensor[i] = 0 if mi is None else mi.__bindable__.device_ptr
-        if outside_media is not None:
-            for i, mo in enumerate(outside_media):
-                self.om_tensor[i] = 0 if mo is None else mo.__bindable__.device_ptr
-        self.surface_scattering_sampler = self.sss_tensor
-        self.surface_emission = self.se_tensor
-        self.inside_media = self.im_tensor
-        self.outside_media = self.om_tensor
-        modules = torch.nn.ModuleList()
-        if surface_emission is not None:
-            modules.extend(surface_emission)
-        if surface_scattering_sampler is not None:
-            modules.extend(surface_scattering_sampler)
-        if inside_media is not None:
-            modules.extend(inside_media)
-        if outside_media is not None:
-            modules.extend(outside_media)
-        self.used_modules = modules
+# class Medium(MapBase):
+#     __extension_info__ = None  # Abstract Node
+#     @staticmethod
+#     def create_extension_info(
+#         fw_code: str,
+#         bw_code: Optional[str] = None,
+#         external_code: Optional[str] = None,
+#         parameters: Optional[Dict] = None
+#     ):
+#         return dict(
+#             generics=dict(INPUT_DIM=7, OUTPUT_DIM=13),
+#             parameters=parameters if parameters is not None else {},
+#             code=f"""
+# {external_code if external_code is not None else ''}
+#
+# FORWARD {{
+#     vec3 x = vec3(_input[0], _input[1], _input[2]);
+#     vec3 w = vec3(_input[3], _input[4], _input[5]);
+#     float d = _input[6];
+#     float Tr = 1.0;
+#     vec3 xout, wout, W = vec3(0.0), A = vec3(0.0);
+#
+#     {fw_code}
+#
+#     _output = float[13] (Tr, xout.x, xout.y, xout.z, wout.x, wout.y, wout.z, W.x, W.y, W.z, A.x, A.y, A.z);
+# }}
+#
+# BACKWARD {{
+#     {bw_code if bw_code is not None else ''}
+# }}
+#             """
+#         )
+#
+#     def __init__(self):
+#         super().__init__()  # x, w, d -> T, xe, we, W, A
+#
+#
+# class NoMedium(Medium):
+#     __extension_info__ = Medium.create_extension_info(f"""
+#         Tr = 1.0; // full transmittance
+#         W = vec3(0.0); // no scattering
+#         A = vec3(0.0); // no accumulation
+#         xout = w * d + x;
+#         wout = w;
+#     """)
+#
+#     __instance__ = None
+#     @classmethod
+#     def get_instance(cls):
+#         if cls.__instance__ is None:
+#             cls.__instance__ = NoMedium()
+#         return cls.__instance__
+#
+#
+# class HomogeneousEmissionMedium(Medium):
+#     __extension_info__ = Medium.create_extension_info(
+#         parameters=dict(
+#             sigma=ParameterDescriptor,
+#             emission=ParameterDescriptor,
+#         ),
+#         fw_code=f"""
+#     float sigma = param_float(parameters.sigma);
+#     vec3 emission = param_vec3(parameters.emission);
+#     Tr = exp(-d * sigma);
+#     W = vec3(0.0);
+#     A = (1 - Tr) * emission;
+#     """)
+#
+#     def __init__(self, sigma: torch.Tensor, emission: torch.Tensor):
+#         super().__init__()
+#         self.sigma = parameter(sigma)
+#         self.emission = parameter(emission)
+#
+#
+#
+#
+#
+# class HomogeneousMedium(Medium):
+#     __extension_info__ = Medium.create_extension_info(
+#         parameters=dict(
+#             sigma=ParameterDescriptor,
+#             scattering_albedo=ParameterDescriptor,
+#             phase_sampler=MapBase
+#         ),
+#         external_code="#include \"sc_phase_sampler.h\"",
+#         fw_code=f"""
+#         float sigma = param_float(parameters.sigma);
+#         vec3 albedo = param_vec3(parameters.scattering_albedo);
+#         Tr = exp(-d * sigma);
+#         float t = -log(1 - random()*(1 - Tr)) / max(0.0000001, sigma);
+#         xout = x + w * t;
+#         float weight, pdf;
+#         wout = sample_phase(object, w, weight, pdf);
+#         W = albedo * weight;
+#         """)
+#
+#     def __init__(self, sigma: torch.Tensor, scattering_albedo: torch.Tensor, phase_sampler: PhaseSampler):
+#         super().__init__()
+#         self.sigma = parameter(sigma)
+#         self.scattering_albedo = parameter(scattering_albedo)
+#         self.phase_sampler = phase_sampler
+#
+#
+# class DTHeterogeneousMedium(Medium):
+#     __extension_info__ = Medium.create_extension_info(
+#         parameters=dict(
+#             sigma=MapBase,
+#             scattering_albedo=MapBase,
+#             phase_sampler=MapBase,
+#             majorant=ParameterDescriptor,
+#         ),
+#         external_code=f"""
+#         #include "sc_phase_sampler.h"
+#         #include "vr_sigma.h"
+#         #include "vr_scattering_albedo.h"
+#         """,
+#         fw_code=f"""
+#     float m = max(0.0001, param_float(parameters.majorant));
+#     A = vec3(0.0);
+#     W = vec3(0.0);
+#     Tr = 1.0;
+#     while (true)
+#     {{
+#         float t = -log(1 - random()) / m;
+#         if (t > d - 0.00001)
+#             break;
+#         x += w * t;
+#         float s = sigma(object, x);
+#         if (random() < s/m) // real interaction
+#         {{
+#             float weight, pdf;
+#             wout = sample_phase(object, w, weight, pdf);
+#             W = scattering_albedo(object, x) * weight;
+#             xout = x;
+#             Tr = 0.0;
+#             break;
+#         }}
+#         d -= t;
+#     }}
+#         """
+#     )
+#
+#     def __init__(self, sigma: MapBase, scattering_albedo: MapBase, phase_sampler: MapBase, majorant: torch.Tensor):
+#         super().__init__()
+#         self.sigma = sigma
+#         self.scattering_albedo = scattering_albedo
+#         self.phase_sampler = phase_sampler
+#         self.majorant = parameter(majorant)
+#
+#
+# class EnvironmentEmission(MapBase):
+#     __extension_info__ = None
+#     def __init__(self):
+#         super().__init__(INPUT_DIM=3, OUTPUT_DIM=3)  # w -> R
+#
+#
+# class Pathtracer(MapBase):
+#     __extension_info__ = dict(
+#         parameters=dict(
+#             surfaces=MapBase,  # Scene to raycast
+#             environment=MapBase,  # Radiance map directional emitted from infinity
+#             surface_emission=torch.Tensor,
+#             surface_scattering_sampler=torch.Tensor,
+#             inside_media=torch.Tensor,
+#             outside_media=torch.Tensor,
+#         ),
+#         dynamics=[
+#             (20, 3),  #surface emitters
+#             (20, 7),  #surface scattering samplers
+#             (7, 13),  #volume scattering
+#         ],
+#         generics=dict(
+#             INPUT_DIM=6,  # x, w
+#             OUTPUT_DIM=3,  # R
+#         ),
+#         path = __INCLUDE_PATH__+'/maps/scene_radiance.h'
+#     )
+#
+#     def __init__(self,
+#                  surfaces: Geometry,
+#                  environment: MapBase,
+#                  surface_emission: Optional[List[MapBase]] = None,
+#                  surface_scattering_sampler: Optional[List[MapBase]] = None,
+#                  inside_media: List[MapBase] = None,
+#                  outside_media: List[MapBase] = None,
+#                  media_filter: Literal['none', 'transmitted', 'emitted', 'scattered'] = 'none'
+#                  ):
+#         super().__init__(surfaces.get_number_of_patches(), MEDIA_FILTER = {'none': 0, 'transmitted': 1, 'emitted': 2, 'scattered': 3}[media_filter])
+#         self.surfaces = surfaces
+#         self.environment = environment
+#         self.sss_tensor = None if surface_scattering_sampler is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
+#         self.se_tensor = None if surface_emission is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
+#         self.im_tensor = None if inside_media is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
+#         self.om_tensor = None if outside_media is None else torch.zeros(surfaces.get_number_of_patches(), dtype=torch.int64, device=device())
+#         if surface_scattering_sampler is not None:
+#             for i, sss in enumerate(surface_scattering_sampler):
+#                 self.sss_tensor[i] = 0 if sss is None else sss.__bindable__.device_ptr
+#         if surface_emission is not None:
+#             for i, e in enumerate(surface_emission):
+#                 self.se_tensor[i] = 0 if e is None else e.__bindable__.device_ptr
+#         if inside_media is not None:
+#             for i, mi in enumerate(inside_media):
+#                 self.im_tensor[i] = 0 if mi is None else mi.__bindable__.device_ptr
+#         if outside_media is not None:
+#             for i, mo in enumerate(outside_media):
+#                 self.om_tensor[i] = 0 if mo is None else mo.__bindable__.device_ptr
+#         self.surface_scattering_sampler = self.sss_tensor
+#         self.surface_emission = self.se_tensor
+#         self.inside_media = self.im_tensor
+#         self.outside_media = self.om_tensor
+#         modules = torch.nn.ModuleList()
+#         if surface_emission is not None:
+#             modules.extend(surface_emission)
+#         if surface_scattering_sampler is not None:
+#             modules.extend(surface_scattering_sampler)
+#         if inside_media is not None:
+#             modules.extend(inside_media)
+#         if outside_media is not None:
+#             modules.extend(outside_media)
+#         self.used_modules = modules
 
 
 # def create_emitters(
