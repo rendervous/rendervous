@@ -1,10 +1,10 @@
 from ._internal import DependencySet, DependentObject, vec3, device, mat3
 from ._maps import ray_position, Grid2D, Grid3D, MapBase, xr_projection, Image2D, XRQuadtreeRandomDirection, \
     FunctionSampler, SH_PDF, \
-    UniformRandomDirection, normalized_box, RayBoxIntersection, constant, ConstantMap, GridRatiotrackingTransmittance, \
+    UniformDirectionSampler, normalized_box, RayBoxIntersection, constant, ConstantMap, GridRatiotrackingTransmittance, \
     ray_direction, \
     PerspectiveCameraSensor, RatiotrackingTransmittance, DeltatrackingTransmittance, GridDeltatrackingTransmittance, \
-    GridDDATransmittance, RaymarchingTransmittance, HGPhase, HGDirectionSampler, identity, HGPhaseSampler, \
+    GridDDATransmittance, RaymarchingTransmittance, HGPhase, HGDirectionSampler, identity, VHGPhaseSampler, \
     DeltatrackingCollisionSampler, MCCollisionIntegrator, MCScatteredRadiance, MCScatteredEmittedRadiance, \
     DeltatrackingPathIntegrator, DeltatrackingNEEPathIntegrator, DRTPathIntegrator, SPSPathIntegrator, \
     DRTDSPathIntegrator, DRTQPathIntegrator, GridDDACollisionIntegrator
@@ -201,7 +201,7 @@ def medium_environment_sampler_quadtree(ds: DependencySet, *, projection: Litera
 
 def medium_environment_sampler_uniform(ds: DependencySet):
     ds.includes(medium_environment)
-    dir_sampling = UniformRandomDirection(3)
+    dir_sampling = UniformDirectionSampler(3)
     ds.add_parameters(environment_sampler=FunctionSampler(point_sampler=dir_sampling, function_map=ds.environment))
 
 def medium_environment_sampler(ds: DependencySet):
@@ -230,7 +230,7 @@ def medium_phase(ds: DependencySet):
     assert ds.phase.output_dim == 1
 
 def medium_phase_sampler_uniform(ds: DependencySet):
-    dir_sampling = UniformRandomDirection(6)
+    dir_sampling = UniformDirectionSampler(6)
     ds.requires(medium_phase)
     ds.add_parameters(phase_sampler=FunctionSampler(identity(6) | dir_sampling, ds.phase)[0, 7, 8, 9])
     assert ds.phase_sampler.input_dim == 6
@@ -238,7 +238,7 @@ def medium_phase_sampler_uniform(ds: DependencySet):
 
 def medium_phase_sampler_HG(ds: DependencySet):
     ds.requires(medium_phase_g)
-    ds.add_parameters(phase_sampler=HGPhaseSampler(ds.phase_g))
+    ds.add_parameters(phase_sampler=VHGPhaseSampler(ds.phase_g))
 
 def medium_phase_sampler(ds: DependencySet):
     if ds.ensures('phase_sampler', MapBase):

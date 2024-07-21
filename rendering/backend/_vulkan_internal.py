@@ -2782,7 +2782,9 @@ class DeviceWrapper:
             borderColor=border_color,
             unnormalizedCoordinates=use_unnormalized_coordinates
         )
-        return SamplerWrapper(self, vkCreateSampler(self.vk_device, info, None))
+        sampler = SamplerWrapper(self, vkCreateSampler(self.vk_device, info, None))
+        self.__resources.add(sampler)
+        return sampler
 
     def create_pipeline(self, pipeline_type: PipelineType):
         pipeline_type = __PIPELINE_TYPE_2_VK__[pipeline_type]

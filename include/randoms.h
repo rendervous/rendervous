@@ -129,6 +129,17 @@ uvec4 create_branch_seed()
     return s;
 }
 
+uvec4 begin_branch_seed()
+{
+    uvec4 s = floatBitsToUint(vec4(random(), random(), random(), random())) + 129;
+    uvec4 main_seed = rdv_rng_state;
+    rdv_rng_state = s;
+    advance_random();
+    advance_random();
+    advance_random();
+    advance_random();
+    return main_seed;
+}
 
 void createOrthoBasis(vec3 N, out vec3 T, out vec3 B)
 {

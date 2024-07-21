@@ -1,6 +1,7 @@
 import torch
 import math
 from typing import Any, Union, Optional
+import numpy as np
 
 
 def _tensify(t, dimension):
@@ -408,16 +409,49 @@ class mat4x3(_GTensorBase):
 
 class mat4(_GTensorBase):
     @staticmethod
-    def inv_look_at(ori: vec3, dir: vec3, nor: vec3):
+    def look_at(ori: vec3, dir: vec3, nor: vec3):
+        """
+        Matrix to convert from world space to camera space
+        """
         dev = ori.device
+        batch_shape = ori.shape[:-1]
         zaxis = dir
         xaxis = vec3.normalize(vec3.cross(nor, zaxis))
         yaxis = vec3.cross(zaxis, xaxis)
-        exp_xaxis = torch.cat([xaxis, torch.zeros(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
-        exp_yaxis = torch.cat([yaxis, torch.zeros(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
-        exp_zaxis = torch.cat([zaxis, torch.zeros(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
-        exp_ori = torch.cat([ori, torch.ones(*xaxis.shape[:-1], 1).to(dev)], dim=-1).unsqueeze(-2)
+        exp_xaxis = torch.cat([xaxis, -vec3.dot(xaxis, ori)], dim=-1).unsqueeze(-2)
+        exp_yaxis = torch.cat([yaxis, -vec3.dot(yaxis, ori)], dim=-1).unsqueeze(-2)
+        exp_zaxis = torch.cat([zaxis, -vec3.dot(zaxis, ori)], dim=-1).unsqueeze(-2)
+        exp_ori = torch.cat([torch.zeros(*batch_shape, 3, device=dev), torch.ones(*batch_shape, 1, device=dev)], dim=-1).unsqueeze(-2)
+        return mat4(torch.cat([exp_xaxis, exp_yaxis, exp_zaxis, exp_ori], dim=-2).transpose(dim0=-1, dim1=-2))
+
+    @staticmethod
+    def inv_look_at(ori: vec3, dir: vec3, nor: vec3):
+        """
+        Matrix to convert from camera space to world space
+        """
+        dev = ori.device
+        batch_shape = ori.shape[:-1]
+        zaxis = dir
+        xaxis = vec3.normalize(vec3.cross(nor, zaxis))
+        yaxis = vec3.cross(zaxis, xaxis)
+        exp_xaxis = torch.cat([xaxis, torch.zeros(*batch_shape, 1, device=dev)], dim=-1).unsqueeze(-2)
+        exp_yaxis = torch.cat([yaxis, torch.zeros(*batch_shape, 1, device=dev)], dim=-1).unsqueeze(-2)
+        exp_zaxis = torch.cat([zaxis, torch.zeros(*batch_shape, 1, device=dev)], dim=-1).unsqueeze(-2)
+        exp_ori = torch.cat([ori, torch.ones(*batch_shape, 1, device=dev)], dim=-1).unsqueeze(-2)
         return mat4(torch.cat([exp_xaxis, exp_yaxis, exp_zaxis, exp_ori], dim=-2))
+
+    @staticmethod
+    def perspective(fov: float, aspect: float, znear: float, zfar: float):
+        yscale = 1.0 / np.tan(fov / 2)
+        xscale = yscale / aspect
+        return mat4(
+            xscale,  0, 0, 0,
+            0, yscale, 0, 0,
+            0, 0, zfar/(zfar - znear), 1.0,
+            0, 0, -znear*zfar/(zfar - znear), 0
+        )
+
+
 
     def inverse(self):
         return mat4(torch.linalg.inv(self))

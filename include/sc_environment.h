@@ -1,5 +1,3 @@
-
-
 void environment(map_object, vec3 x, vec3 we, out vec3 E)
 {
     float[3] _output;// = float[3](0.0, 0.0, 0.0);

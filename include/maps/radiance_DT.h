@@ -25,5 +25,5 @@ BACKWARD
     vec3 x = vec3(_input[0], _input[1], _input[2]);
     vec3 w = vec3(_input[3], _input[4], _input[5]);
     vec3 dL_dR = vec3(_output_grad[0], _output_grad[1], _output_grad[2]);
-    path_integrator_DT_bw(object, x, w, 0.0, dL_dR);
+    path_integrator_DT_bw(object, x, w, parameters.ds_epsilon, dL_dR);
 }

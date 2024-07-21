@@ -27,8 +27,18 @@
 #define SAVE_SEED(v) uvec4 _rdv_saved_seed_##v = get_seed();
 #define SET_SEED(v) set_seed(_rdv_saved_seed_##v);
 #define BRANCH_SEED(v) uvec4 _rdv_saved_seed_##v = create_branch_seed();
+#define SEED(v) _rdv_saved_seed_##v
+
+#define BEGIN_BRANCH(v) uvec4 _rdv_saved_seed_##v = begin_branch_seed();
+#define END_BRANCH(v) set_seed(_rdv_saved_seed_##v);
+
 
 #define PRINT debugPrintfEXT
+#ifdef ENABLE_ASSERT
+#define ASSERT(cond, message) if (!(cond)) debugPrintfEXT(message);
+#else
+#define ASSERT(cond, message) ;
+#endif
 
 #define SWITCH_SEED(from_seed, to_seed) \
 _rdv_saved_seed_##from_seed = get_seed(); \

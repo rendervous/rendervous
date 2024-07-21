@@ -34,7 +34,7 @@ void medium_path_integrator(map_object, vec3 x, vec3 w, float d, out float T, ou
     #if MEDIUM_FILTER & 2 == 2
             A = gathering(object, x, w);
     #endif
-            break;
+            return;
         }
     #else
         T *= (1 - s/majorant);
@@ -43,7 +43,7 @@ void medium_path_integrator(map_object, vec3 x, vec3 w, float d, out float T, ou
             if (random() >= T)
             {
                 T = 0.0;
-                break;
+                return;
             }
             T = 1.0;
         }

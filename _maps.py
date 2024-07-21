@@ -148,9 +148,9 @@ class DispatcherEngine:
                 assert allow_block, 'Can not create a nested block. Add a name attribute to the dictionary to make it a struct'
                 code = "{"
                 for field_id, field_type in type_definition.items():
-                    t, field_inner_structures, sizes = cls.create_code_for_map_declaration(field_type,
-                                                                                           getattr(field_value,
-                                                                                                   field_id))
+                    f = getattr(field_value, field_id)
+                    assert field_type != MapBase or f.obj is not None, f'Field {field_id} must be bound to a non-null map'
+                    t, field_inner_structures, sizes = cls.create_code_for_map_declaration(field_type, f)
                     code += t + " " + field_id + ''.join(f"[{size if size > 0 else ''}]" for size in sizes) + '; \n'
                     inner_structures.update(field_inner_structures)
                 code += '}'
@@ -786,7 +786,8 @@ void main()
                 b.start_index = batch * batch_size
             submit(man)
 
-        # output_ptr.mark_as_dirty()
+        output_ptr.mark_as_dirty()
+        output_ptr.invalidate()
 
         capture_object._pos_eval(False)
         field._pos_eval(False)
@@ -877,10 +878,12 @@ void main()
 
         map_object._pre_eval(False)
 
+        output_ptr = wrap_gpu(output, 'out')
+
         with cls.__ENGINE_OBJECTS__['map_fw_eval'] as b:
             b.main_map = wrap_gpu(map_object)
             b.input = wrap_gpu(input)
-            b.output = wrap_gpu(output, 'out')
+            b.output = output_ptr
             b.seeds[:] = get_seeds()
             b.start_index = 0
             b.total_threads = total_threads
@@ -889,7 +892,10 @@ void main()
 
         map_object._pos_eval(False)
 
-        return output
+        output_ptr.mark_as_dirty()
+        output_ptr.invalidate()
+
+        return output.clone()
 
     @classmethod
     def eval_map_backward(cls, map_object: 'MapBase', input: torch.Tensor, output_grad: torch.Tensor):
@@ -921,11 +927,13 @@ void main()
 
             map_object._pre_eval(True)
 
+            input_grad_ptr = wrap_gpu(input_grad, 'inout')
+
             with cls.__ENGINE_OBJECTS__['map_bw_eval'] as b:
                 b.main_map = wrap_gpu(map_object)
                 b.input = wrap_gpu(input)
                 b.output_grad = wrap_gpu(output_grad)
-                b.input_grad = wrap_gpu(input_grad, 'inout')
+                b.input_grad = input_grad_ptr
                 b.seeds[:] = get_seeds()
                 b.start_index = 0
                 b.total_threads = total_threads
@@ -933,6 +941,9 @@ void main()
             submit(man)
 
             map_object._pos_eval(True)
+
+            input_grad_ptr.mark_as_dirty()
+            input_grad_ptr.invalidate()
 
             return input_grad
 
@@ -1256,6 +1267,9 @@ class MapBase(GPUDirectModule, metaclass=MapMeta):
             return v1, v1.like_this(v2)
         return v2.like_this(v1), v2
 
+    def custom_gradient(self, map: 'MapBase') -> 'MapBase':
+        return CustomGradMap(self, map)
+
     def __add__(self, other):
         return AdditionMap(*MapBase.make_match(self, other))
 
@@ -1523,7 +1537,7 @@ class PerspectiveCameraSensor(SensorsBase):
             znear=float
         ),
         generics=dict(OUTPUT_DIM=6),
-        path=__INCLUDE_PATH__+"/maps/camera_perspective.h"
+        path=__INCLUDE_PATH__+"/maps/perspective_camera_sensor.h"
     )
 
     def __init__(self, width: int, height: int, poses: torch.Tensor, jittered: bool = False):
@@ -1551,8 +1565,6 @@ class PerspectiveCameraSensor(SensorsBase):
         return torch.cat([x, w], dim=-1)
 
 
-# # Map Operations
-#
 class Composition(MapBase):
     __extension_info__ = dict(
         parameters=dict(
@@ -1560,24 +1572,11 @@ class Composition(MapBase):
             outter=MapBase
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        code="""
-FORWARD {
-    float intermediate [INTERMEDIATE_DIM];
-    forward(parameters.inner, _input, intermediate);
-    forward(parameters.outter, intermediate, _output);    
-}
-
-BACKWARD {
-    float intermediate [INTERMEDIATE_DIM];
-    forward(parameters.inner, _input, intermediate);
-    float intermediate_grad [INTERMEDIATE_DIM]; [[unroll]] for (int i=0; i<INPUT_DIM; i++) intermediate_grad[i] = 0.0;
-    backward(parameters.outter, intermediate, _output_grad, intermediate_grad);
-    backward(parameters.inner, _input, intermediate, intermediate_grad, _input_grad);
-}
-""",
+        path=__INCLUDE_PATH__ + '/maps/composition.h'
     )
 
     def __init__(self, inner: MapBase, outter: MapBase):
+        assert inner.output_dim == outter.input_dim
         super(Composition, self).__init__(INPUT_DIM=inner.input_dim, INTERMEDIATE_DIM=inner.output_dim,
                                           OUTPUT_DIM=outter.output_dim)
         self.inner = inner
@@ -1587,137 +1586,69 @@ BACKWARD {
         return self.outter.forward_torch(self.inner.forward_torch(*args))
 
 
+class CustomGradMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            fw=MapBase,
+            bw=MapBase
+        ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
+        path=__INCLUDE_PATH__ + '/maps/custom_grad.h'
+    )
+
+    def __init__(self, fw: MapBase, bw: MapBase):
+        assert fw.input_dim == bw.input_dim
+        assert fw.output_dim == bw.output_dim
+        super().__init__(INPUT_DIM=fw.input_dim, OUTPUT_DIM=fw.output_dim)
+        self.fw = fw
+        self.bw = bw
+
+
+
+
 class BinaryOpMap(MapBase):
     __extension_info__ = None  # Mark as an abstract map
 
     @staticmethod
-    def create_extension_info(operation_code, requires_input, backward_code):
+    def create_extension_info(path: str):
         return dict(
             parameters=dict(
                 map_a=MapBase,
                 map_b=MapBase
             ),
             bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-            code=f"""
-FORWARD {{
-    float _temp[OUTPUT_DIM];
-    forward(parameters.map_a, _input, _output);
-    forward(parameters.map_b, _input, _temp);
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        _output[i] {operation_code}= _temp[i];  
-}}       
-BACKWARD {{
-    {('float a[OUTPUT_DIM]; forward(parameters.map_a, _input, a); float b[OUTPUT_DIM]; forward(parameters.map_b, _input, b);') if requires_input else ''}
-    {backward_code}
-}}
-"""
+            path=path
         )
 
     def __init__(self, map_a: MapBase, map_b: MapBase):
+        assert map_a.input_dim == map_b.input_dim
+        assert map_a.output_dim == map_b.output_dim
         super(BinaryOpMap, self).__init__(INPUT_DIM=map_a.input_dim, OUTPUT_DIM=map_a.output_dim)
         self.map_a = map_a
         self.map_b = map_b
 
-    def torch_operation(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        pass
-
-    def forward_torch(self, *args):
-        return self.torch_operation(self.map_a(*args), self.map_b(*args))
-
 
 class AdditionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info('+', False, backward_code="""
-backward(parameters.map_a, _input, _output_grad, _input_grad);
-backward(parameters.map_b, _input, _output_grad, _input_grad);
-     """)
-
-    def __init__(self, map_a: MapBase, map_b: MapBase):
-        super(AdditionMap, self).__init__(map_a, map_b)
-
-    def torch_operation(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a + b
+    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_add.h')
 
 
 class SubtractionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info('-', False, backward_code="""
-backward(parameters.map_a, _input, _output_grad, _input_grad);
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++)
-    _output_grad[i] *= -1;
-backward(parameters.map_b, _input, _output_grad, _input_grad);
-     """)
-
-    def __init__(self, map_a: MapBase, map_b: MapBase):
-        super(SubtractionMap, self).__init__(map_a, map_b)
-
-    def torch_operation(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a - b
+    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_sub.h')
 
 
 class MultiplicationMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info('*', True, backward_code="""
-float dL_darg[OUTPUT_DIM];
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] * b[i];
-backward(parameters.map_a, _input, a, dL_darg, _input_grad); // output provided just in case
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] * a[i];
-backward(parameters.map_b, _input, b, dL_darg, _input_grad); // output provided just in case
-    """)
-
-    def __init__(self, map_a: MapBase, map_b: MapBase):
-        super(MultiplicationMap, self).__init__(map_a, map_b)
-
-    def torch_operation(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a * b
+    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_mul.h')
 
 
 class DivisionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info('/', True, backward_code="""
-float dL_darg[OUTPUT_DIM];
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] / b[i];
-backward(parameters.map_a, _input, dL_darg, _input_grad);
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++) b[i] *= b[i];
-[[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dL_darg[i] = _output_grad[i] * a[i] / b[i]; // already squared
-backward(parameters.map_b, _input, dL_darg, _input_grad);
-    """)
-
-    def __init__(self, map_a: MapBase, map_b: MapBase):
-        super(DivisionMap, self).__init__(map_a, map_b)
-
-    def torch_operation(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a / b
+    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_div.h')
 
 
 class PromoteMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(map=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
-        code="""
-FORWARD {
-    float r[1];
-    forward(parameters.map, _input, r);
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        _output[i] = r[0];
-}
-
-BACKWARD {
-    float dL_dr[1];
-    dL_dr[0] = 0.0;
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        dL_dr[0] += _output_grad[i];
-    backward(parameters.map, _input, dL_dr, _input_grad);
-}
-
-BACKWARD_USING_OUTPUT { // Internal map could make advantage of precomputed output
-    float dL_dr[1];
-    dL_dr[0] = 0.0;
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        dL_dr[0] += _output_grad[i];
-    backward(parameters.map, _input, float[1](_output[0]), dL_dr, _input_grad);
-}
-"""
+        path=__INCLUDE_PATH__+'/maps/promote.h'
     )
 
     def __init__(self, map: MapBase, dim: int):
@@ -1737,18 +1668,7 @@ class ConstantMap(MapBase):
             value=ParameterDescriptor
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        code="""
-FORWARD {
-    float_ptr data_ptr = float_ptr(parameters.value.data);
-    [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _output[i] = data_ptr.data[i];
-}
-BACKWARD {
-    if (parameters.value.grad_data == 0) return;
-    float_ptr grad_data = float_ptr(parameters.value.grad_data);
-    [[unroll]] for (int i=0; i<OUTPUT_DIM; i++)
-        atomicAdd_f(grad_data, i, _output_grad[i]);
-}
-"""
+        path=__INCLUDE_PATH__+'/maps/constant.h'
     )
 
     def __init__(self, input_dim: int, value: Union[torch.Tensor, torch.nn.Parameter]):
@@ -1768,34 +1688,7 @@ class ConcatMap(MapBase):
             map_b=MapBase
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
-        code="""
-    FORWARD {
-        float output_a[A_OUTPUT_DIM];
-        forward(parameters.map_a, _input, output_a);
-        float output_b[B_OUTPUT_DIM];
-        forward(parameters.map_b, _input, output_b);
-        [[unroll]] for (int i=0; i < A_OUTPUT_DIM; i++) _output[i] = output_a[i];
-        [[unroll]] for (int i=0; i < B_OUTPUT_DIM; i++) _output[i + A_OUTPUT_DIM] = output_b[i];
-    }
-    BACKWARD {
-        float output_a_grad[A_OUTPUT_DIM];
-        [[unroll]] for (int i=0; i < A_OUTPUT_DIM; i++) output_a_grad[i] = _output_grad[i];
-        backward(parameters.map_a, _input, output_a_grad, _input_grad);
-        float output_b_grad[B_OUTPUT_DIM];
-        [[unroll]] for (int i=0; i < B_OUTPUT_DIM; i++) output_b_grad[i] = _output_grad[i + A_OUTPUT_DIM];
-        backward(parameters.map_b, _input, output_b_grad, _input_grad);
-    }
-    BACKWARD_USING_OUTPUT {
-        float output_a_grad[A_OUTPUT_DIM];
-        float output_a[A_OUTPUT_DIM];
-        [[unroll]] for (int i=0; i < A_OUTPUT_DIM; i++) { output_a_grad[i] = _output_grad[i]; output_a[i] = _output[i] }
-        backward(parameters.map_a, _input, output_a, output_a_grad, _input_grad);
-        float output_b_grad[B_OUTPUT_DIM];
-        float output_b[B_OUTPUT_DIM];
-        [[unroll]] for (int i=0; i < B_OUTPUT_DIM; i++) { output_b_grad[i] = _output_grad[i + A_OUTPUT_DIM]; output_b[i] = _output[i + A_OUTPUT_DIM] }
-        backward(parameters.map_b, _input, output_b, output_b_grad, _input_grad);
-    }
-    """
+        path=__INCLUDE_PATH__ + '/maps/concat.h'
     )
 
     def __init__(self, map_a: MapBase, map_b: MapBase):
@@ -1817,23 +1710,11 @@ class IndexMap(MapBase):
             indices=[32, int]
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        code="""
-        FORWARD {
-            float output_map[MAP_OUTPUT_DIM];
-            forward(parameters.map, _input, output_map);
-            [[unroll]] for (int i=0; i < MAP_OUTPUT_DIM; i++) _output[i] = output_map[parameters.indices[i]];
-        }
-        BACKWARD {
-            float output_map_grad[MAP_OUTPUT_DIM];
-            [[unroll]] for (int i=0; i < MAP_OUTPUT_DIM; i++) output_map_grad[i] = 0.0;
-            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) output_map_grad[parameters.indices[i]] += _output_grad[i];
-            backward(parameters.map, _input, output_map_grad, _input_grad);
-        }
-        """
+        path=__INCLUDE_PATH__ + '/maps/index.h'
     )
 
     def __init__(self, map: MapBase, indices: List[int]):
-        assert all(i<map.output_dim for i in indices)
+        assert all(i >= 0 and i<map.output_dim for i in indices)
         super(IndexMap, self).__init__(
             INPUT_DIM=map.input_dim,
             OUTPUT_DIM=len(indices),
@@ -1844,25 +1725,17 @@ class IndexMap(MapBase):
             self.indices[i] = indices[i]
 
 
-class SelectMap(MapBase):
+class InputSelectMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             indices=[32, int]
         ),
-        code="""
-        FORWARD {
-            float output_map[OUTPUT_DIM];
-            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _output[i] = _input[parameters.indices[i]];
-        }
-        BACKWARD {
-            [[unroll]] for (int i=0; i < OUTPUT_DIM; i++) _input_grad[parameters.indices[i]] += _output_grad[i];
-        }
-        """
+        path=__INCLUDE_PATH__+'/maps/input_select.h'
     )
 
     def __init__(self, input_dim: int, indices: List[int]):
         assert all(i >= 0 and i<input_dim for i in indices)
-        super(SelectMap, self).__init__(
+        super(InputSelectMap, self).__init__(
             INPUT_DIM=input_dim,
             OUTPUT_DIM=len(indices)
         )
@@ -1873,84 +1746,84 @@ class SelectMap(MapBase):
 
 # Sensors
 
-class CameraSensor(SensorsBase):
-    __extension_info__ = dict(
-        parameters=dict(
-            origin=torch.Tensor,
-            direction=torch.Tensor,
-            normal=torch.Tensor,
-            width=int,
-            height=int,
-            generation_mode=int,
-            fov=float,
-            znear=float
-        ),
-        generics=dict(OUTPUT_DIM=6),
-        code=f"""
-FORWARD
-{{
-    ivec3 index = floatBitsToInt(vec3(_input[0], _input[1], _input[2]));
-    vec3_ptr origin_buf = vec3_ptr(parameters.origin);
-    vec3_ptr direction_buf = vec3_ptr(parameters.direction);
-    vec3_ptr normal_buf = vec3_ptr(parameters.normal);
-    vec3 o = origin_buf.data[index[0]];
-    vec3 d = direction_buf.data[index[0]];
-    vec3 n = normal_buf.data[index[0]];
-
-    vec2 subsample = vec2(0.5);
-    if (parameters.generation_mode == 1)
-        subsample = vec2(random(), random());
-
-    float sx = ((index[2] + subsample.x) * 2 - parameters.width) * parameters.znear / parameters.height;
-    float sy = ((index[1] + subsample.y) * 2 - parameters.height) * parameters.znear / parameters.height;
-    float sz = parameters.znear / tan(parameters.fov * 0.5);
-
-    vec3 zaxis = normalize(d);
-    vec3 xaxis = normalize(cross(n, zaxis));
-    vec3 yaxis = cross(zaxis, xaxis);
-
-    vec3 x, w;
-
-    w = xaxis * sx + yaxis * sy + zaxis * sz;
-    x = o + w;
-    w = normalize(w);
-
-    _output = float[6]( x.x, x.y, x.z, w.x, w.y, w.z );
-}}
-"""
-    )
-
-    def __init__(self, width: int, height: int, cameras: int = 1, jittered: bool = False):
-        super(CameraSensor, self).__init__([cameras, height, width])
-        self.origin = tensor(cameras, 3, dtype=torch.float32)
-        self.direction = tensor(cameras, 3, dtype=torch.float32)
-        self.normal = tensor(cameras, 3, dtype=torch.float32)
-        self.origin[:] = 0.0
-        self.origin[:, 2] = -1.0
-        self.direction[:] = 0.0
-        self.direction[:, 2] = 1.0
-        self.normal[:] = 0.0
-        self.normal[:, 1] = 1.0
-        self.fov = np.pi / 4
-        self.znear = 0.001
-        self.width = width
-        self.height = height
-        self.generation_mode = 0 if not jittered else 1
-
-    def generate_measuring_points_torch(self, indices):
-        o = self.origin[indices[:, 0]]
-        d = self.direction[indices[:, 0]]
-        n = self.normal[indices[:, 0]]
-        dim = torch.tensor([self.height, self.width], dtype=torch.float, device=indices.device)
-        s = ((indices[:, 1:3] + 0.5) * 2 - dim) * self.znear / self.height
-        t = np.float32(self.znear / np.float32(np.tan(np.float32(self.fov) * np.float32(0.5))))
-        zaxis = vec3.normalize(d)
-        xaxis = vec3.normalize(vec3.cross(n, zaxis))
-        yaxis = vec3.cross(zaxis, xaxis)
-        w = xaxis * s[:, 1:2] + yaxis * s[:, 0:1] + zaxis * t
-        x = o + w
-        w = vec3.normalize(w)
-        return torch.cat([x, w], dim=-1)
+# class CameraSensor(SensorsBase):
+#     __extension_info__ = dict(
+#         parameters=dict(
+#             origin=torch.Tensor,
+#             direction=torch.Tensor,
+#             normal=torch.Tensor,
+#             width=int,
+#             height=int,
+#             generation_mode=int,
+#             fov=float,
+#             znear=float
+#         ),
+#         generics=dict(OUTPUT_DIM=6),
+#         code=f"""
+# FORWARD
+# {{
+#     ivec3 index = floatBitsToInt(vec3(_input[0], _input[1], _input[2]));
+#     vec3_ptr origin_buf = vec3_ptr(parameters.origin);
+#     vec3_ptr direction_buf = vec3_ptr(parameters.direction);
+#     vec3_ptr normal_buf = vec3_ptr(parameters.normal);
+#     vec3 o = origin_buf.data[index[0]];
+#     vec3 d = direction_buf.data[index[0]];
+#     vec3 n = normal_buf.data[index[0]];
+#
+#     vec2 subsample = vec2(0.5);
+#     if (parameters.generation_mode == 1)
+#         subsample = vec2(random(), random());
+#
+#     float sx = ((index[2] + subsample.x) * 2 - parameters.width) * parameters.znear / parameters.height;
+#     float sy = ((index[1] + subsample.y) * 2 - parameters.height) * parameters.znear / parameters.height;
+#     float sz = parameters.znear / tan(parameters.fov * 0.5);
+#
+#     vec3 zaxis = normalize(d);
+#     vec3 xaxis = normalize(cross(n, zaxis));
+#     vec3 yaxis = cross(zaxis, xaxis);
+#
+#     vec3 x, w;
+#
+#     w = xaxis * sx + yaxis * sy + zaxis * sz;
+#     x = o + w;
+#     w = normalize(w);
+#
+#     _output = float[6]( x.x, x.y, x.z, w.x, w.y, w.z );
+# }}
+# """
+#     )
+#
+#     def __init__(self, width: int, height: int, cameras: int = 1, jittered: bool = False):
+#         super(CameraSensor, self).__init__([cameras, height, width])
+#         self.origin = tensor(cameras, 3, dtype=torch.float32)
+#         self.direction = tensor(cameras, 3, dtype=torch.float32)
+#         self.normal = tensor(cameras, 3, dtype=torch.float32)
+#         self.origin[:] = 0.0
+#         self.origin[:, 2] = -1.0
+#         self.direction[:] = 0.0
+#         self.direction[:, 2] = 1.0
+#         self.normal[:] = 0.0
+#         self.normal[:, 1] = 1.0
+#         self.fov = np.pi / 4
+#         self.znear = 0.001
+#         self.width = width
+#         self.height = height
+#         self.generation_mode = 0 if not jittered else 1
+#
+#     def generate_measuring_points_torch(self, indices):
+#         o = self.origin[indices[:, 0]]
+#         d = self.direction[indices[:, 0]]
+#         n = self.normal[indices[:, 0]]
+#         dim = torch.tensor([self.height, self.width], dtype=torch.float, device=indices.device)
+#         s = ((indices[:, 1:3] + 0.5) * 2 - dim) * self.znear / self.height
+#         t = np.float32(self.znear / np.float32(np.tan(np.float32(self.fov) * np.float32(0.5))))
+#         zaxis = vec3.normalize(d)
+#         xaxis = vec3.normalize(vec3.cross(n, zaxis))
+#         yaxis = vec3.cross(zaxis, xaxis)
+#         w = xaxis * s[:, 1:2] + yaxis * s[:, 0:1] + zaxis * t
+#         x = o + w
+#         w = vec3.normalize(w)
+#         return torch.cat([x, w], dim=-1)
 
 
 class Grid3DSensor(SensorsBase):
@@ -1964,20 +1837,7 @@ class Grid3DSensor(SensorsBase):
             sd=float
         ),
         generics=dict(OUTPUT_DIM=3),
-        code=f"""
-FORWARD
-{{
-    ivec3 index = floatBitsToInt(vec3(_input[0], _input[1], _input[2]));
-    vec3 subsample = vec3(0.0);
-    if (parameters.sd != 0)
-        subsample = gauss3() * parameters.sd;
-
-    vec3 sx = vec3((index[2] + subsample.x) / (parameters.width - 1), (index[1] + subsample.y) / (parameters.height - 1), (index[0] + subsample.z) / (parameters.depth - 1));
-
-    sx = (parameters.box_max - parameters.box_min) * sx + parameters.box_min;        
-    _output = float[3]( sx.x, sx.y, sx.z );
-}}
-    """
+        path=__INCLUDE_PATH__ + '/maps/grid3d_sensor.h'
     )
 
     def __init__(self, width: int, height: int, depth: int = 1, box_min: vec3 = vec3(-1.0, -1.0, -1.0),
@@ -2006,13 +1866,7 @@ class Box3DSensor(SensorsBase):
             box_max=vec3
         ),
         generics=dict(OUTPUT_DIM=3),
-        code=f"""
-FORWARD
-{{
-    vec3 sx = (parameters.box_max - parameters.box_min) * vec3(random(), random(), random()) + parameters.box_min;        
-    _output = float[3]( sx.x, sx.y, sx.z );
-}}
-    """
+        path=__INCLUDE_PATH__ + '/maps/box_sensor.h'
     )
 
     def __init__(self, samples, box_min: vec3 = vec3(-1.0, -1.0, -1.0), box_max: vec3 = vec3(1.0, 1.0, 1.0)):
@@ -2053,33 +1907,7 @@ class Grid2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        code="""
-FORWARD
-{
-    vec2 c = vec2(_input[0], _input[1]);
-    vec2 ncoord = (c - parameters.bmin) * parameters.inv_bsize;
-    if (any(lessThan(ncoord, vec2(0.0))) || any(greaterThanEqual(ncoord, vec2(1.0)))) {
-        [[unroll]]
-        for (int i=0; i<OUTPUT_DIM; i++)
-            _output[i] = 0.0;
-        return;
-    }
-    vec2 grid_coord = ncoord * vec2(parameters.grid.shape[1] - 1, parameters.grid.shape[0] - 1);
-    ivec2 p = ivec2(floor(grid_coord));
-    vec2 alpha = grid_coord - p;
-    float_ptr grid_buf_00 = param_buffer(parameters.grid, p + ivec2(0,0)); 
-    float_ptr grid_buf_01 = param_buffer(parameters.grid, p + ivec2(1,0)); 
-    float_ptr grid_buf_10 = param_buffer(parameters.grid, p + ivec2(0,1)); 
-    float_ptr grid_buf_11 = param_buffer(parameters.grid, p + ivec2(1,1)); 
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        _output[i] = mix(
-            mix(grid_buf_00.data[i], grid_buf_01.data[i], alpha.x),
-            mix(grid_buf_10.data[i], grid_buf_11.data[i], alpha.x), alpha.y
-        );
-}
-
-"""
+        path=__INCLUDE_PATH__ + '/maps/grid2d.h'
     )
 
     def __init__(self, grid: Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
@@ -2109,34 +1937,7 @@ class Image2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        code="""
-FORWARD
-{
-    vec2 c = vec2(_input[0], _input[1]);
-    vec2 ncoord = (c - parameters.bmin) * parameters.inv_bsize;
-    if (any(lessThan(ncoord, vec2(0.0))) || any(greaterThanEqual(ncoord, vec2(1.0)))) {
-        [[unroll]]
-        for (int i=0; i<OUTPUT_DIM; i++)
-            _output[i] = 0.0;
-        return;
-    }
-    vec2 grid_coord = (ncoord * vec2(parameters.grid.shape[1], parameters.grid.shape[0]) - vec2(0.5));
-    ivec2 max_dim = ivec2(parameters.grid.shape[1], parameters.grid.shape[0]) - 1;
-    ivec2 p = ivec2(floor(grid_coord));
-    vec2 alpha = grid_coord - p;
-    float_ptr grid_buf_00 = param_buffer(parameters.grid, clamp(p + ivec2(0,0), ivec2(0), max_dim)); 
-    float_ptr grid_buf_01 = param_buffer(parameters.grid, clamp(p + ivec2(1,0), ivec2(0), max_dim)); 
-    float_ptr grid_buf_10 = param_buffer(parameters.grid, clamp(p + ivec2(0,1), ivec2(0), max_dim)); 
-    float_ptr grid_buf_11 = param_buffer(parameters.grid, clamp(p + ivec2(1,1), ivec2(0), max_dim)); 
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        _output[i] = mix(
-            mix(grid_buf_00.data[i], grid_buf_01.data[i], alpha.x),
-            mix(grid_buf_10.data[i], grid_buf_11.data[i], alpha.x), alpha.y
-        );
-}
-
-"""
+        path=__INCLUDE_PATH__ + '/maps/image2d.h'
     )
 
     def __init__(self, grid: Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
@@ -2167,84 +1968,7 @@ class Grid3D(MapBase):
             inv_bsize=vec3
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        code="""
-        
-void blend(map_object, inout float dst[OUTPUT_DIM], float_ptr src, float alpha)
-{
-    [[unroll]] for (int i=0; i<OUTPUT_DIM; i++) dst[i] += src.data[i] * alpha;
-} 
-
-FORWARD
-{
-    vec3 c = vec3(_input[0], _input[1], _input[2]);
-    vec3 ncoord = (c - parameters.bmin) * parameters.inv_bsize;
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-        _output[i] = 0.0;
-    if (any(lessThan(ncoord, vec3(0.0))) || any(greaterThanEqual(ncoord, vec3(1.0))))
-    {
-        return;
-    }
-    ivec3 dim = ivec3(parameters.grid.shape[2] - 1, parameters.grid.shape[1] - 1, parameters.grid.shape[0] - 1);
-    vec3 grid_coord = ncoord * vec3(dim);
-    vec3 alpha = fract(grid_coord);
-    ivec3 p = clamp(ivec3(grid_coord), ivec3(0), dim - 1);
-    float_ptr g = param_buffer(parameters.grid, p + ivec3(0,0,0));
-    blend(object, _output, g, (1 - alpha.x)*(1 - alpha.y)*(1 - alpha.z));
-    g = param_buffer(parameters.grid, p + ivec3(1,0,0));
-    blend(object, _output, g, alpha.x*(1 - alpha.y)*(1 - alpha.z));
-    g = param_buffer(parameters.grid, p + ivec3(0,1,0));
-    blend(object, _output, g, (1 - alpha.x)*alpha.y*(1 - alpha.z));
-    g = param_buffer(parameters.grid, p + ivec3(1,1,0));
-    blend(object, _output, g, alpha.x*alpha.y*(1 - alpha.z));
-    g = param_buffer(parameters.grid, p + ivec3(0,0,1));
-    blend(object, _output, g, (1 - alpha.x)*(1 - alpha.y)*alpha.z);
-    g = param_buffer(parameters.grid, p + ivec3(1,0,1));
-    blend(object, _output, g, alpha.x*(1 - alpha.y)*alpha.z);
-    g = param_buffer(parameters.grid, p + ivec3(0,1,1));
-    blend(object, _output, g, (1 - alpha.x)*alpha.y*alpha.z);
-    g = param_buffer(parameters.grid, p + ivec3(1,1,1));
-    blend(object, _output, g, alpha.x*alpha.y*alpha.z);
-}
-
-BACKWARD
-{
-    if (parameters.grid.grad_data == 0) // NULL GRAD
-        return;
-    
-    vec3 c = vec3(_input[0], _input[1], _input[2]);
-    vec3 ncoord = (c - parameters.bmin) * parameters.inv_bsize;
-    
-    if (any(lessThan(ncoord, vec3(0.0))) || any(greaterThanEqual(ncoord, vec3(1.0))))
-        return;
-
-    ivec3 dim = ivec3(parameters.grid.shape[2] - 1, parameters.grid.shape[1] - 1, parameters.grid.shape[0] - 1);
-    vec3 grid_coord = ncoord * vec3(dim);
-    vec3 alpha = fract(grid_coord);
-    ivec3 p = clamp(ivec3(grid_coord), ivec3(0), dim - 1);
-    float_ptr g000 = param_grad_buffer(parameters.grid, p + ivec3(0,0,0));
-    float_ptr g001 = param_grad_buffer(parameters.grid, p + ivec3(1,0,0));
-    float_ptr g010 = param_grad_buffer(parameters.grid, p + ivec3(0,1,0));
-    float_ptr g011 = param_grad_buffer(parameters.grid, p + ivec3(1,1,0));
-    float_ptr g100 = param_grad_buffer(parameters.grid, p + ivec3(0,0,1));
-    float_ptr g101 = param_grad_buffer(parameters.grid, p + ivec3(1,0,1));
-    float_ptr g110 = param_grad_buffer(parameters.grid, p + ivec3(0,1,1));
-    float_ptr g111 = param_grad_buffer(parameters.grid, p + ivec3(1,1,1));
-    
-    [[unroll]]
-    for (int i=0; i<OUTPUT_DIM; i++)
-    {
-        atomicAdd_f(g000, i, _output_grad[i] * (1 - alpha.x) * (1 - alpha.y) * (1 - alpha.z));
-        atomicAdd_f(g001, i, _output_grad[i] * (alpha.x) * (1 - alpha.y) * (1 - alpha.z));
-        atomicAdd_f(g010, i, _output_grad[i] * (1 - alpha.x) * (alpha.y) * (1 - alpha.z));
-        atomicAdd_f(g011, i, _output_grad[i] * (alpha.x) * (alpha.y) * (1 - alpha.z));
-        atomicAdd_f(g100, i, _output_grad[i] * (1 - alpha.x) * (1 - alpha.y) * (alpha.z));
-        atomicAdd_f(g101, i, _output_grad[i] * (alpha.x) * (1 - alpha.y) * (alpha.z));
-        atomicAdd_f(g110, i, _output_grad[i] * (1 - alpha.x) * (alpha.y) * (alpha.z));
-        atomicAdd_f(g111, i, _output_grad[i] * (alpha.x) * (alpha.y) * (alpha.z));
-    }
-}
-"""
+        path=__INCLUDE_PATH__ + '/maps/grid3d.h'
     )
 
     def __init__(self, grid: torch.Tensor, bmin: vec3 = vec3(-1.0, -1.0, -1.0), bmax: vec3 = vec3(1.0, 1.0, 1.0)):
@@ -2292,18 +2016,32 @@ class Transformed3DMap(MapBase):
             inverse_transform=mat4
         ),
         generics=dict(INPUT_DIM=3),
-        code = f"""
-    FORWARD {{
-        vec4 x = vec4(_input[0], _input[1], _input[2], 1.0);
-        x = parameters.inverse_transform * x;
-        x.xyz /= x.w;
-        forward(parameters.base_map, float[3](x.x, x.y, x.z), _output);
-    }}
-        """
+        bw_implementations = BACKWARD_IMPLEMENTATIONS.DEFAULT,
+        path = __INCLUDE_PATH__ + '/maps/transform_3D_map.h'
     )
 
     def __init__(self, base_map: MapBase, transform: mat4 ):
         assert base_map.input_dim == 3
+        super().__init__(OUTPUT_DIM=base_map.output_dim)
+        self.base_map = base_map
+        self.transform = transform
+        self.inverse_transform = mat4.inverse(transform)
+
+
+class TransformedRayMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            base_map=MapBase,
+            transform=mat4,
+            inverse_transform=mat4
+        ),
+        generics=dict(INPUT_DIM=6),
+        bw_implementations = BACKWARD_IMPLEMENTATIONS.DEFAULT,
+        path = __INCLUDE_PATH__ + '/maps/transform_ray_map.h'
+    )
+
+    def __init__(self, base_map: MapBase, transform: mat4 ):
+        assert base_map.input_dim == 6
         super().__init__(OUTPUT_DIM=base_map.output_dim)
         self.base_map = base_map
         self.transform = transform
@@ -2317,20 +2055,7 @@ class XRProjection(MapBase):
         generics=dict(
             OUTPUT_DIM=2
         ),
-        code = """
-FORWARD
-{
-#if INPUT_DIM == 3
-    _input[0] += 0.0000001 * int(_input[2] == 0.0 && _input[0] == 0.0);
-    _output[0] = atan(_input[0], _input[2]) * inverseOfPi;
-    _output[1] = 2 * acos(clamp(_input[1], -1.0, 1.0)) / pi - 1;
-#else
-    _input[3] += 0.0000001 * int(_input[5] == 0.0 && _input[3] == 0.0);
-    _output[0] = atan(_input[3], _input[5]) * inverseOfPi;
-    _output[1] = 2 * acos(clamp(_input[4], -1.0, 1.0)) / pi - 1;
-#endif
-}
-""",
+        path=__INCLUDE_PATH__ + '/maps/xr_projection.h'
     )
 
     def __init__(self, ray_input: bool = False):
@@ -2356,25 +2081,14 @@ class OctProjection(MapBase):
         generics=dict(
             OUTPUT_DIM=2
         ),
-        code = """
-FORWARD
-{
-#if INPUT_DIM == 3
-    vec3 w = vec3(_input[0], _input[1], _input[2]);
-#else
-    vec3 w = vec3(_input[0], _input[1], _input[2]);
-#endif
-    vec2 c = dir2oct(w);
-    _output = float[2](c.x, c.y);
-}
-""",
+        path=__INCLUDE_PATH__ + '/maps/oct_projection.h'
     )
 
     def __init__(self, ray_input: bool = False):
         super().__init__(INPUT_DIM=6 if ray_input else 3)
 
 
-class OctInvProjection(MapBase):
+class OctUnprojection(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
@@ -2382,80 +2096,42 @@ class OctInvProjection(MapBase):
             INPUT_DIM=2,
             OUTPUT_DIM=3
         ),
-        code = """
-FORWARD
-{
-    vec2 c = vec2(_input[0], _input[1]);
-    vec3 w = oct2dir(c);
-    _output = float[3](w.x, w.y, w.z);
-}
-""",
+        path=__INCLUDE_PATH__ + '/maps/oct_unprojection.h'
     )
 
 
-class UniformRandom(MapBase):
+class UniformSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
-        code="""
-        FORWARD
-        {
-            [[unroll]] for (int i=0; i<OUTPUT_DIM - 1; i++) _output[i] = random();
-            _output[OUTPUT_DIM-1] = 1.0;
-        }
-                """,
+        path=__INCLUDE_PATH__+'/maps/uniform_sampler.h'
     )
 
     def __init__(self, input_dim, point_dim):
-        super(UniformRandom, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=point_dim + 1)
+        super(UniformSampler, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=point_dim + 1)
 
 
-class GaussianRandom(MapBase):
+class GaussianSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
-        code="""
-FORWARD
-{
-    float sum = 0; 
-    [[unroll]] for (int i=0; i<(OUTPUT_DIM - 1) / 2; i++)
-    {
-        vec2 r = gauss2();
-        _output[i*2] = r.x;
-        _output[i*2 + 1] = r.y;
-        sum += dot(r, r);
-    }
-    if (OUTPUT_DIM % 2 == 0)
-    {
-        float r = gauss();
-        _output[OUTPUT_DIM-2] = r;
-        sum += r * r;
-    }
-    _output[OUTPUT_DIM-1] = pow(two_pi, 0.5 * (OUTPUT_DIM-1)) * exp (0.5 * sum); // 1 / pdf(x)
-}
-                    """,
+        path=__INCLUDE_PATH__ + '/maps/gaussian_sampler.h'
     )
 
     def __init__(self, input_dim, output_dim):
-        super(GaussianRandom, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=output_dim)
+        super(GaussianSampler, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=output_dim)
 
 
-class UniformRandomDirection(MapBase):
+class UniformDirectionSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
         generics=dict(OUTPUT_DIM=4),
-        code="""
-    FORWARD
-    {
-        vec3 w_out = randomDirection();
-        _output = float[4](w_out.x, w_out.y, w_out.z, 4 * pi);
-    }
-            """,
+        path=__INCLUDE_PATH__ +'/maps/uniform_direction_sampler.h'
     )
 
     def __init__(self, input_dim):
-        super(UniformRandomDirection, self).__init__(INPUT_DIM=input_dim)
+        super(UniformDirectionSampler, self).__init__(INPUT_DIM=input_dim)
 
 
 class XRQuadtreeRandomDirection(MapBase):
@@ -4329,7 +4005,7 @@ FORWARD
         self.phase_g = phase_g
 
 
-class HGPhaseSampler(MapBase):
+class VHGPhaseSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             phase_g=MapBase
@@ -4347,7 +4023,7 @@ FORWARD
         """
     )
     def __init__(self, phase_g: MapBase):
-        super(HGPhaseSampler, self).__init__()
+        super().__init__()
         self.phase_g = phase_g
 
 
@@ -4671,7 +4347,7 @@ def xr_projection(ray_input: bool = False):
     return XRProjection(ray_input=ray_input)
 
 def oct_inv_projection():
-    return OctInvProjection()
+    return OctUnprojection()
 
 def tsr(cls, translate: vec3 = vec3(0.0, 0.0, 0.0), scale: vec3 = vec3(1.0, 1.0, 1.0), rotatation_axis: vec3 = vec3(0.0, 1.0, 0.0), rotation_angle: float = 0.0):
     raise NotImplementedError()

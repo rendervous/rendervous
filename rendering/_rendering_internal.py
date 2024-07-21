@@ -34,7 +34,7 @@ def compile_shader_source(code, stage, include_dirs):
     if os.name == 'nt':  # Windows
         p = subprocess.Popen(
             os.path.expandvars(
-                '%VULKAN_SDK%/Bin/glslangValidator.exe --stdin -r -Os -V --target-env vulkan1.2 ').replace("\\", "/")
+                '%VULKAN_SDK%/Bin/glslangValidator.exe --stdin -r -Os -V --target-env vulkan1.3 ').replace("\\", "/")
             + f'-S {stage} {idirs}', stdin=subprocess.PIPE
         )
         outs, errs = p.communicate(code.encode('utf-8'))
@@ -54,7 +54,7 @@ def compile_shader_source(code, stage, include_dirs):
         raise RuntimeError(f"Cannot compile {numbered_code}")
     with open(f'{stage}.spv', 'rb') as f:
         binary_output = f.read(-1)
-    print(code)
+    # print(code)
     print(f'[INFO] Compiled code for {stage}')
     return binary_output
 
@@ -65,7 +65,7 @@ def compile_shader_source_file(filename, stage, binary_file_name, include_dirs=[
     if os.name == 'nt':  # Windows
         p = subprocess.Popen(
             os.path.expandvars(
-                '%VULKAN_SDK%/Bin/glslangValidator.exe -r -V --target-env vulkan1.2 ').replace("\\", "/")
+                '%VULKAN_SDK%/Bin/glslangValidator.exe -r -V --target-env vulkan1.3 ').replace("\\", "/")
             + f'-S {stage} {idirs} \"{filename}\" -o \"{binary_file_name}\"'
         )
     else:  # Assuming Linux
@@ -73,7 +73,7 @@ def compile_shader_source_file(filename, stage, binary_file_name, include_dirs=[
         import shlex
         p = subprocess.Popen(
             shlex.split(
-                os.path.expandvars('/usr/bin/glslangValidator -r -V --target-env vulkan1.2 ').replace("\\",
+                os.path.expandvars('/usr/bin/glslangValidator -r -V --target-env vulkan1.3 ').replace("\\",
                                                                                                       "/")
                 + f'-S {stage} {idirs} \"{filename}\" -o \"{binary_file_name}\"')
         )

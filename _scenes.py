@@ -60,40 +60,7 @@ class MeshBoundary(Boundary):
             INPUT_DIM=6,  # x, w
             OUTPUT_DIM=3,  # t, is_entering, patch_index
         ),
-        code="""
-FORWARD
-{
-    // input x, w,
-    vec3 x = vec3(_input[0], _input[1], _input[2]);
-    vec3 w = vec3(_input[3], _input[4], _input[5]);
-
-    rayQueryEXT rayQuery_mesh;
-    rayQueryInitializeEXT(rayQuery_mesh,              // Ray query
-                        accelerationStructureEXT(parameters.mesh_ads),                  // Top-level acceleration structure
-                        gl_RayFlagsOpaqueEXT,  // Ray flags, here saying "treat all geometry as opaque"
-                        0xFF,                  // 8-bit instance mask, here saying "trace against all instances"
-                        x,                  // Ray origin
-                        0.0,                   // Minimum t-value
-                        w,            // Ray direction
-                        10000.0);              // Maximum t-value
-
-    while(rayQueryProceedEXT(rayQuery_mesh))
-        rayQueryConfirmIntersectionEXT(rayQuery_mesh);
-
-    int index = -1;
-    int from_outside = 0;
-    float t = 100000.0;
-    
-    if (rayQueryGetIntersectionTypeEXT(rayQuery_mesh, true) != gl_RayQueryCommittedIntersectionNoneEXT)
-    {
-    
-        from_outside = rayQueryGetIntersectionFrontFaceEXT(rayQuery_mesh, true) ? 1 : 0;
-        index = 0;
-        t = rayQueryGetIntersectionTEXT(rayQuery_mesh, true);
-    }
-    _output = float[3](t, intBitsToFloat(from_outside), intBitsToFloat(index));
-}
-        """
+        path=__INCLUDE_PATH__+'/maps/boundary_mesh.h'
     )
 
     def __init__(self, mesh: 'MeshGeometry'):
@@ -123,75 +90,7 @@ class GroupBoundary(Boundary):
         generics=dict(
             INPUT_DIM=6, OUTPUT_DIM=3
         ),
-        code="""
-    FORWARD
-    {
-        // input x, w,
-        vec3 x = vec3(_input[0], _input[1], _input[2]);
-        vec3 w = vec3(_input[3], _input[4], _input[5]);
-
-        rayQueryEXT rayQuery;
-        rayQueryInitializeEXT(rayQuery,              // Ray query
-                            accelerationStructureEXT(parameters.group_ads),                  // Top-level acceleration structure
-                            gl_RayFlagsOpaqueEXT,  // Ray flags, here saying "treat all geometry as opaque"
-                            0xFF,                  // 8-bit instance mask, here saying "trace against all instances"
-                            x,                  // Ray origin
-                            0.0,                   // Minimum t-value
-                            w,            // Ray direction
-                            10000.0);              // Maximum t-value
-
-        // closest cached value among AABB candidates
-        int patch_index = -1;
-        float global_t = 100000.0;
-        int from_outside = 0;
-
-        while (rayQueryProceedEXT(rayQuery)) // traverse to find intersections
-        {
-            switch (rayQueryGetIntersectionTypeEXT(rayQuery, false))
-            {
-                case gl_RayQueryCandidateIntersectionTriangleEXT:
-                    // any triangle intersection is accepted
-                    rayQueryConfirmIntersectionEXT(rayQuery);
-                    // rayQueryTerminateEXT(rayQuery);
-                break;
-                #if ONLY_MESHES == 0
-                case gl_RayQueryCandidateIntersectionAABBEXT:
-                    // any implicit hit is computed and cached in global surfel
-                    // Get the instance (patch) hit
-                    int index = 0;//rayQueryGetIntersectionInstanceIdEXT(rayQuery, false); // instance index
-                    mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, false);
-                    vec3 tx = transform_position(x, w2o);
-                    vec3 tw = transform_direction(w, w2o);
-                    float _local_input[6] = float[6](tx.x, tx.y, tx.z, tw.x, tw.y, tw.z);
-                    float _current[16];
-                    RaycastableInfo raycastInfo = RaycastableInfo(parameters.patches[index]);
-                    dynamic_forward(object, raycastInfo.callable_map, _local_input, _current);
-                    float current_t;
-                    int current_patch_index;
-                    Surfel current_surfel;
-                    if (hit2surfel(tx, tw, _current, current_t, current_patch_index, current_surfel) && (patch_index == -1 || current_t < global_t)) // replace closest surfel
-                    {
-                        patch_index = index;//current_patch_index + int_ptr(parameters.patch_offsets).data[index];
-                        global_t = current_t;
-                        from_outside = dot(tw, current_surfel.N) < 0 ? 1 : 0;
-                    }
-                    rayQueryGenerateIntersectionEXT(rayQuery, current_t);
-                break;
-                #endif
-            }
-        } 
-        
-        // check for the committed intersection to replace surfel if committed was a triangle
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT)
-        {
-            from_outside = rayQueryGetIntersectionFrontFaceEXT(rayQuery, true) ? 1 : 0;
-            patch_index = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true); // instance index
-            global_t = rayQueryGetIntersectionTEXT(rayQuery, true);
-        }
-
-        _output = float[3] (global_t, intBitsToFloat(from_outside), intBitsToFloat(patch_index));
-    } 
-        """
+        path=__INCLUDE_PATH__ + '/maps/boundary_group.h'
     )
 
     def __init__(self, geometry: 'GroupGeometry'):
@@ -322,23 +221,7 @@ class TransformedGeometry(Geometry):
             base_geometry=MapBase,
             transform=ParameterDescriptor
         ),
-        code="""
-    FORWARD {
-        vec3 x = vec3(_input[0], _input[1], _input[2]);
-        vec3 w = vec3(_input[3], _input[4], _input[5]);
-        mat4x3 T = mat4x3_ptr(parameters.transform.data).data[0];
-        mat4x3 invT = inverse_transform(T);
-        vec3 xt = transform_position(x, invT); 
-        vec3 wt = transform_direction(w, invT);
-        forward(parameters.base_geometry, float[6](xt.x, xt.y, xt.z, wt.x, wt.y, wt.z), _output);
-        Surfel s;
-        float t;
-        int patch_index;
-        hit2surfel(x, w, _output, t, patch_index, s);
-        s = transform(s, T);
-        surfel2array(t, patch_index, s, _output);
-    }
-        """
+        path=__INCLUDE_PATH__ + '/maps/geometry_transformed.h'
     )
 
     def __init__(self, base_geometry: Geometry, initial_transform: Optional[torch.Tensor] = None):
@@ -375,37 +258,7 @@ class MeshGeometry(Geometry):
             INPUT_DIM=6,  # x, w
             OUTPUT_DIM=16,  # t, N, G, C, T, B, patch_index
         ),
-        code="""
-FORWARD
-{
-    // input x, w,
-    vec3 x = vec3(_input[0], _input[1], _input[2]);
-    vec3 w = vec3(_input[3], _input[4], _input[5]);
-
-    rayQueryEXT rayQuery_mesh;
-    rayQueryInitializeEXT(rayQuery_mesh,              // Ray query
-                        accelerationStructureEXT(parameters.mesh_ads),                  // Top-level acceleration structure
-                        gl_RayFlagsOpaqueEXT,  // Ray flags, here saying "treat all geometry as opaque"
-                        0xFF,                  // 8-bit instance mask, here saying "trace against all instances"
-                        x,                  // Ray origin
-                        0.0,                   // Minimum t-value
-                        w,            // Ray direction
-                        10000.0);              // Maximum t-value
-
-    while(rayQueryProceedEXT(rayQuery_mesh))
-        rayQueryConfirmIntersectionEXT(rayQuery_mesh);
-
-    if (rayQueryGetIntersectionTypeEXT(rayQuery_mesh, true) != gl_RayQueryCommittedIntersectionNoneEXT)
-    {
-        int index = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery_mesh, true);
-        vec2 bar = rayQueryGetIntersectionBarycentricsEXT(rayQuery_mesh, true); 
-        float t = rayQueryGetIntersectionTEXT(rayQuery_mesh, true);
-        surfel2array(t, 0, sample_surfel(MeshInfo(parameters.mesh_info), index, bar), _output);
-    }
-    else
-        noHit2array(_output);
-}
-        """
+        path=__INCLUDE_PATH__ + '/maps/geometry_mesh.h'
     )
 
     @staticmethod
@@ -684,88 +537,9 @@ class GroupGeometry(Geometry):
             INPUT_DIM=6,  # x, w
             OUTPUT_DIM=16,  # t, N, G, C, T, B, patch_index
         ),
-        code="""
-    FORWARD
-    {
-        // input x, w,
-        vec3 x = vec3(_input[0], _input[1], _input[2]);
-        vec3 w = vec3(_input[3], _input[4], _input[5]);
-
-        rayQueryEXT rayQuery;
-        rayQueryInitializeEXT(rayQuery,              // Ray query
-                            accelerationStructureEXT(parameters.group_ads),                  // Top-level acceleration structure
-                            gl_RayFlagsOpaqueEXT,  // Ray flags, here saying "treat all geometry as opaque"
-                            0xFF,                  // 8-bit instance mask, here saying "trace against all instances"
-                            x,                  // Ray origin
-                            0.0,                   // Minimum t-value
-                            w,            // Ray direction
-                            10000.0);              // Maximum t-value
-
-        // closest cached value among AABB candidates
-        int patch_index = -1;
-        float global_t = 100000.0;
-        Surfel global_surfel = Surfel(vec3(0.0), vec3(0.0), vec3(0.0), vec2(0.0), vec3(0.0), vec3(0.0));
-
-        while (rayQueryProceedEXT(rayQuery)) // traverse to find intersections
-        {
-            switch (rayQueryGetIntersectionTypeEXT(rayQuery, false))
-            {
-                case gl_RayQueryCandidateIntersectionTriangleEXT:
-                    // any triangle intersection is accepted
-                    rayQueryConfirmIntersectionEXT(rayQuery);
-                    //rayQueryTerminateEXT(rayQuery);
-                break;
-                #if ONLY_MESHES == 0
-                case gl_RayQueryCandidateIntersectionAABBEXT:
-                    // any implicit hit is computed and cached in global surfel
-
-                    // Get the instance (patch) hit
-                    int index = 0;//rayQueryGetIntersectionInstanceIdEXT(rayQuery, false); // instance index
-                    mat4x3 w2o = rayQueryGetIntersectionWorldToObjectEXT(rayQuery, false);
-                    mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, false);
-
-                    vec3 tx = transform_position(x, w2o);
-                    vec3 tw = transform_direction(w, w2o);
-                    float _local_input[6] = float[6](tx.x, tx.y, tx.z, tw.x, tw.y, tw.z);
-                    float _current[16];
-                    RaycastableInfo raycastInfo = RaycastableInfo(parameters.patches[index]);
-                    dynamic_forward(object, raycastInfo.callable_map, _local_input, _current);
-                    float current_t;
-                    int current_patch_index;
-                    Surfel current_surfel;
-                    if (hit2surfel(tx, tw, _current, current_t, current_patch_index, current_surfel) && (patch_index == -1 || current_t < global_t)) // replace closest surfel
-                    {
-                        patch_index = index;//current_patch_index + int_ptr(parameters.patch_offsets).data[index];
-                        global_t = current_t;
-                        global_surfel = transform(current_surfel, o2w);
-                    }
-                    rayQueryGenerateIntersectionEXT(rayQuery, current_t);
-                break;
-                #endif
-            }
-        }
-        
-        // check for the committed intersection to replace surfel if committed was a triangle
-        if (rayQueryGetIntersectionTypeEXT(rayQuery, true) == gl_RayQueryCommittedIntersectionTriangleEXT)
-        {
-            mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rayQuery, true);
-            int index = rayQueryGetIntersectionInstanceIdEXT(rayQuery, true); // instance index
-            int primitive_index = rayQueryGetIntersectionPrimitiveIndexEXT(rayQuery, true);
-            vec2 baricentrics = rayQueryGetIntersectionBarycentricsEXT(rayQuery, true);
-            global_t = rayQueryGetIntersectionTEXT(rayQuery, true);
-            RaycastableInfo raycastInfo = RaycastableInfo(parameters.patches[index]);
-            MeshInfo meshInfo = MeshInfo(raycastInfo.mesh_info);
-            global_surfel = transform(sample_surfel(meshInfo, primitive_index, baricentrics), o2w);        
-            // global_surfel = sample_surfel(meshInfo, primitive_index, baricentrics);        
-            patch_index = index;
-        }
-
-        surfel2array(global_t, patch_index, global_surfel, _output);
-    }
-            """
+        path=__INCLUDE_PATH__ + '/maps/geometry_group.h'
     )
 
-    __GEOMETRY_ID__ = 0
 
     @staticmethod
     def _flatten_patches(geometries: Iterable[Geometry]):
@@ -777,7 +551,6 @@ class GroupGeometry(Geometry):
         return patch_infos, patch_geometries
 
     def __init__(self, *geometries: Geometry):
-        GroupGeometry.__GEOMETRY_ID__ += 1
         # Tag with a generic that a new geometry collection is needed to differentiate from others within nested dynamic calls
         _per_patch_infos, _per_patch_geometries = GroupGeometry._flatten_patches(geometries)
         def all_meshes(g):
@@ -790,7 +563,7 @@ class GroupGeometry(Geometry):
             return False
 
         is_only_meshes = 1 if all(all_meshes(geom) for geom in geometries) else 0
-        super().__init__(len(_per_patch_infos), RDV_GEOMETRY_ID=GroupGeometry.__GEOMETRY_ID__, ONLY_MESHES=is_only_meshes)
+        super().__init__(len(_per_patch_infos), ONLY_MESHES=is_only_meshes)
         self._per_patch_infos, self._per_patch_geometries = _per_patch_infos, _per_patch_geometries
         self._per_patch_geometries_tensor = torch.tensor(_per_patch_geometries, dtype=torch.int64).unsqueeze(-1)
         self.geometries_module_list = torch.nn.ModuleList(geometries)
@@ -936,21 +709,7 @@ class EnvironmentSampler(MapBase):  # x -> we, E(we)/pdf(we), pdf(we)
 
 class XREnvironment(Environment):
     __extension_info__ = Environment.create_extension_info(
-        """
-    void environment(map_object, vec3 x, vec3 w, out vec3 E)
-    {
-        vec2 xr = dir2xr(w);
-        float[3] R;
-        forward(parameters.environment_img, float[2](xr.x, xr.y), R);
-        E = vec3(R[0], R[1], R[2]); 
-    }
-    void environment_bw(map_object, vec3 x, vec3 w, vec3 dL_dE)
-    {
-        vec2 xr = dir2xr(w);
-        float[3] dL_dR = float[3](dL_dE.x, dL_dE.y, dL_dE.z);
-        backward(parameters.environment_img, float[2](xr.x, xr.y), dL_dR);
-    }
-        """,
+        __INCLUDE_PATH__ + '/maps/environment_xr.h',
         environment_img = MapBase
     )
     def __init__(self, environment_img: MapBase):
@@ -960,30 +719,7 @@ class XREnvironment(Environment):
 
 class XREnvironmentSamplerPDF(EnvironmentSamplerPDF):
     __extension_info__ = EnvironmentSamplerPDF.create_extension_info(
-        """
-    void environment_sampler_pdf(map_object, vec3 x, vec3 w, out float pdf)
-    {
-        // compute w converted to pixel px, py and to z-order index
-        vec2 xr = dir2xr(w);
-        vec2 c = xr * 0.5 + vec2(0.5); // 0,0 - 1,1
-        ivec2 p = ivec2(clamp(c, vec2(0.0), vec2(0.999999)) * (1 << parameters.levels));
-        int index = pixel2morton(p);
-        // compute last level offset 4*(4^(levels - 1) - 1)/3 and peek pdf of the cell 
-        pdf = 1.0;
-        if (parameters.levels > 0) // more than one node
-        {
-            int offset = 4 * (1 << (2 * (parameters.levels - 1)) - 1) / 3;
-            // peek the density and compute final point pdf
-            float_ptr densities_buf = float_ptr(parameters.densities);
-            pdf = densities_buf.data[offset + index];
-        }
-        // multiply by peek in that area
-        vec2 p0 = vec2(p) / (1 << parameters.levels);
-        vec2 p1 = vec2(p + ivec2(1)) / (1 << parameters.levels);
-        float pixel_area = 2 * pi * (cos(p0.y*pi) - cos(p1.y*pi)) / (1 << parameters.levels);
-        pdf *= 1.0 / pixel_area;
-    }
-        """,
+        __INCLUDE_PATH__ + '/maps/environment_sampler_pdf_xr.h',
         densities=torch.Tensor,  # quadtree probabilities
         levels=int,  # Number of levels of the quadtree
     )
@@ -996,96 +732,7 @@ class XREnvironmentSamplerPDF(EnvironmentSamplerPDF):
 
 class XREnvironmentSampler(EnvironmentSampler):
     __extension_info__ = EnvironmentSampler.create_extension_info(
-        """
-    #include "sc_environment.h"
-        
-    void environment_sampler(map_object, vec3 x, out vec3 w, out vec3 E, out float pdf)
-    {
-        float_ptr densities_buf = float_ptr(parameters.densities);
-        float sel = random();
-        int current_node = 0;
-        vec2 p0 = vec2(0,0);
-        vec2 p1 = vec2(1,1);
-        float prob = 1;
-        [[unroll]]
-        for (int i=0; i<parameters.levels; i++)
-        {
-            int offset = current_node * 4;
-            int selected_child = 3;
-            prob = densities_buf.data[offset + 3];
-            [[unroll]]
-            for (int c = 0; c < 3; c ++)
-                if (sel < densities_buf.data[offset + c])
-                {
-                    selected_child = c;
-                    prob = densities_buf.data[offset + c];
-                    break;
-                }
-                else
-                    sel -= densities_buf.data[offset + c];;
-            float xmed = (p1.x + p0.x)/2;
-            float ymed = (p1.y + p0.y)/2;
-            if (selected_child % 2 == 0) // left
-                p1.x = xmed;
-            else
-                p0.x = xmed;
-            if (selected_child / 2 == 0) // top
-                p1.y = ymed;
-            else
-                p0.y = ymed;
-            current_node = current_node * 4 + 1 + selected_child;
-        }
-        float pixel_area = 2 * pi * (cos(p0.y*pi) - cos(p1.y*pi)) / (1 << parameters.levels);
-        w = randomDirection((p0.x * 2 - 1) * pi, (p1.x * 2 - 1) * pi, p0.y * pi, p1.y * pi);
-        environment(object, x, w, E);
-        E *= pixel_area / max(0.000000001, prob);
-        pdf = max(0.000000001, prob) / pixel_area;
-    }
-    
-    void environment_sampler_bw(map_object, vec3 x, vec3 out_w, vec3 out_E, vec3 dL_dw, vec3 dL_dE)
-    {  
-        // replay sampling the quadtree
-        float_ptr densities_buf = float_ptr(parameters.densities);
-        float sel = random();
-        int current_node = 0;
-        vec2 p0 = vec2(0,0);
-        vec2 p1 = vec2(1,1);
-        float prob = 1;
-        [[unroll]]
-        for (int i=0; i<parameters.levels; i++)
-        {
-            int offset = current_node * 4;
-            int selected_child = 3;
-            prob = densities_buf.data[offset + 3];
-            [[unroll]]
-            for (int c = 0; c < 3; c ++)
-                if (sel < densities_buf.data[offset + c])
-                {
-                    selected_child = c;
-                    prob = densities_buf.data[offset + c];
-                    break;
-                }
-                else
-                    sel -= densities_buf.data[offset + c];;
-            float xmed = (p1.x + p0.x)/2;
-            float ymed = (p1.y + p0.y)/2;
-            if (selected_child % 2 == 0) // left
-                p1.x = xmed;
-            else
-                p0.x = xmed;
-            if (selected_child / 2 == 0) // top
-                p1.y = ymed;
-            else
-                p0.y = ymed;
-            current_node = current_node * 4 + 1 + selected_child;
-        }
-        float pixel_area = 2 * pi * (cos(p0.y*pi) - cos(p1.y*pi)) / (1 << parameters.levels);
-        out_w = randomDirection((p0.x * 2 - 1) * pi, (p1.x * 2 - 1) * pi, p0.y * pi, p1.y * pi);
-        dL_dE *= pixel_area / max(0.000000001, prob); 
-        environment_bw(object, x, out_w, dL_dE);
-    }
-    
-        """,
+        __INCLUDE_PATH__+'/maps/environment_sampler_xr.h',
         environment=MapBase,  # Map with ray-dependent radiances
         densities=torch.Tensor,  # quadtree probabilities
         levels=int,  # Number of levels of the quadtree
@@ -1119,13 +766,7 @@ class XREnvironmentSampler(EnvironmentSampler):
 
 class UniformEnvironmentSampler(EnvironmentSampler):
     __extension_info__ = EnvironmentSampler.create_extension_info(
-        """
-        #include "sc_environment.h"
-        void environment_sampler(map_object, vec3 x, out vec3 w, out vec3 E, out float pdf)
-            w = randomDirection();
-            environment(object, x, w, E);
-            pdf = .25/pi;
-        """,
+        __INCLUDE_PATH__ + '/maps/environment_sampler_uniform.h',
         environment=MapBase
     )
 
@@ -1957,14 +1598,14 @@ class MediumPathIntegrator(MapBase):
         parameters.update(dict(gathering=MapBase))
         return dict(
             parameters = parameters,
-            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
-            generics = dict(INPUT_DIM=7, OUTPUT_DIM=13),
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
+            generics = dict(INPUT_DIM=7, OUTPUT_DIM=12),
             path=path
         )
 
     @staticmethod
     def signature():
-        return (7, 13)
+        return (7, 12)
 
     def __init__(self, gathering: Optional[MapBase] = None, medium_filter: int = 3):
         if gathering is None:
@@ -1994,6 +1635,70 @@ class DTMediumPathIntegrator(MediumPathIntegrator):
         self.scattering_albedo = scattering_albedo
         self.phase_sampler = phase_sampler
         self.majorant = parameter(majorant)
+
+
+class DTVolumePathIntegrator(MediumPathIntegrator):
+    __extension_info__ = MediumPathIntegrator.create_extension_info(
+        __INCLUDE_PATH__ + '/maps/volume_path_integrator_DT.h',
+        sigma=MapBase,
+        scattering_albedo=MapBase,
+        phase_sampler=MapBase,
+        majorant=ParameterDescriptor,
+        boundaries=MapBase
+    )
+
+    def __init__(self,
+                 sigma: MapBase,
+                 majorant: torch.Tensor,
+                 boundaries: Boundary,
+                 scattering_albedo: Optional[MapBase] = None,
+                 phase_sampler: Optional[MapBase] = None,
+                 gathering: Optional[MapBase] = None,
+                 medium_filter: int = 3):
+        if scattering_albedo is None or phase_sampler is None:
+            medium_filter &= 2
+            scattering_albedo = constant(3, 0.0, 0.0, 0.0)
+            phase_sampler = constant(3, 0.0, 0.0, 0.0, 0.0, 0.0)
+        super().__init__(gathering, medium_filter=medium_filter)
+        self.sigma = sigma
+        self.scattering_albedo = scattering_albedo
+        self.phase_sampler = phase_sampler
+        self.majorant = parameter(majorant)
+        self.boundaries = boundaries
+
+
+class DSVolumePathIntegrator(MediumPathIntegrator):
+    __extension_info__ = MediumPathIntegrator.create_extension_info(
+        __INCLUDE_PATH__ + '/maps/volume_path_integrator_DS.h',
+        sigma=MapBase,
+        scattering_albedo=MapBase,
+        phase_sampler=MapBase,
+        majorant=ParameterDescriptor,
+        boundaries=MapBase,
+        ds_epsilon=float
+    )
+
+    def __init__(self,
+                 sigma: MapBase,
+                 majorant: torch.Tensor,
+                 boundaries: Boundary,
+                 scattering_albedo: Optional[MapBase] = None,
+                 phase_sampler: Optional[MapBase] = None,
+                 gathering: Optional[MapBase] = None,
+                 ds_epsilon: float = 0.1,
+                 medium_filter: int = 3):
+        if scattering_albedo is None or phase_sampler is None:
+            medium_filter &= 2
+            scattering_albedo = constant(3, 0.0, 0.0, 0.0)
+            phase_sampler = constant(3, 0.0, 0.0, 0.0, 0.0, 0.0)
+        super().__init__(gathering, medium_filter=medium_filter)
+        self.sigma = sigma
+        self.scattering_albedo = scattering_albedo
+        self.phase_sampler = phase_sampler
+        self.majorant = parameter(majorant)
+        self.boundaries = boundaries
+        self.ds_epsilon = ds_epsilon
+
 
 
 class RTMediumPathIntegrator(MediumPathIntegrator):
@@ -2086,39 +1791,24 @@ class HomogeneousMediumPathIntegrator(MediumPathIntegrator):
 class VolumeGathering(MapBase):
     __extension_info__ = None
     @staticmethod
-
     def create_extension_info(
-            fw_code: str,
-            bw_code: Optional[str] = None,
-            parameters: Optional[Dict] = None,
-            external_code: Optional[str] = None, **kwargs
+            path_or_code: str,
+            **parameters
     ):
-        if bw_code is None:
-            bw_code = ''
-        if parameters is None:
-            parameters = {}
-        if external_code is None:
-            external_code = ''
+        if ',' in path_or_code:
+            code = """
+        #include "volume_gathering_interface.h"
+                    """ + path_or_code
+            path = None
+        else:
+            path = path_or_code
+            code = None
         return dict(
             parameters=parameters,
             generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
-            bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-            code=f"""
-       {external_code}
-
-       FORWARD {{
-           vec3 x = vec3(_input[0], _input[1], _input[2]);
-           vec3 w = vec3(_input[3], _input[4], _input[5]);
-           vec3 A = vec3(0.0);
-           {fw_code}
-           _output = float[3](A.x, A.y, A.z);
-       }}
-
-       BACKWARD {{
-           {bw_code}
-       }}
-               """,
-            **kwargs
+            bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
+            code=code,
+            path=path
         )
 
     @staticmethod
@@ -2128,19 +1818,9 @@ class VolumeGathering(MapBase):
 
 class VolumeEmissionGathering(VolumeGathering):
     __extension_info__ = VolumeGathering.create_extension_info(
-        parameters=dict(
-            scattering_albedo=MapBase,
-            emission=MapBase
-        ),
-        fw_code=f"""
-    forward(parameters.emission, _input, _output);
-    float[3] sa;
-    forward(parameters.scattering_albedo, float[3](_input[0], _input[1], _input[2]), sa);
-    _output[0] *= 1 - sa[0];
-    _output[1] *= 1 - sa[1];
-    _output[2] *= 1 - sa[2];
-    return;
-        """
+        __INCLUDE_PATH__ + '/maps/volume_emission_gathering.h',
+        scattering_albedo=MapBase,
+        emission=MapBase
     )
 
     def __init__(self, scattering_albedo: Optional[MapBase], emission: Optional[MapBase]):
@@ -2151,55 +1831,19 @@ class VolumeEmissionGathering(VolumeGathering):
 
 class VolumeEnvironmentGathering(VolumeGathering):
     __extension_info__ = VolumeGathering.create_extension_info(
-        parameters=dict(
-            environment_sampler=MapBase,
-            visibility=MapBase,
-            scattering_albedo=MapBase,
-            phase=MapBase,
-        ),
-        external_code="""
-        #include "vr_scattering_albedo.h"
-        #include "sc_visibility.h"
-        #include "sc_environment_sampler.h"
-        """,
-        fw_code="""
-        
-        vec3 we, E;
-        float pdf;
-        environment_sampler(object, x, we, E, pdf);
-        //E = vec3(1.0);
-        //pdf = 1.0;
-        //we = randomDirection(w);
-        
-        if (E == vec3(0.0))
-        {
-            _output = float[3](0.0, 0.0, 0.0);
-            return;
-        }
-    
-        vec3 W = scattering_albedo(object, x);
-
-        float rho[1];
-        forward(parameters.phase, float[6](w.x, w.y, w.z, we.x, we.y, we.z), rho);
-        W *= rho[0];
-
-        if (W == vec3(0.0))
-        {
-            _output = float[3](0.0, 0.0, 0.0);
-            return;
-        }
-        
-        float Tr = ray_visibility(object, x, we);
-        A += Tr * W * E; 
-             """
+        __INCLUDE_PATH__ + '/maps/volume_environment_gathering.h',
+        environment_sampler=MapBase,
+        visibility=MapBase,
+        scattering_albedo=MapBase,
+        homogeneous_phase=MapBase,
     )
 
-    def __init__(self, environment_sampler: EnvironmentSampler, visibility: MapBase, scattering_albedo: Optional[MapBase], phase: Optional[MapBase]):
+    def __init__(self, environment_sampler: EnvironmentSampler, visibility: MapBase, scattering_albedo: Optional[MapBase], homogeneous_phase: Optional[MapBase]):
         super().__init__()
         self.environment_sampler = environment_sampler
         self.visibility = visibility
         self.scattering_albedo = constant(3, 0.0, 0.0, 0.0) if scattering_albedo is None else scattering_albedo
-        self.phase = constant(6, 0.0) if phase is None else phase
+        self.homogeneous_phase = constant(6, 0.0) if homogeneous_phase is None else homogeneous_phase
 
 
 
@@ -2362,27 +2006,49 @@ class HGPhaseSampler(PhaseSampler):
 
 
 class MediumMaterial:
-    def __init__(self, path_integrator_factory: Callable[[Optional[MapBase], int], MapBase], scattering_albedo: Optional[MapBase] = None, phase_sampler: Optional['PhaseSampler'] = None, emission: Optional[MapBase] = None, enclosed: bool = False):
+    def __init__(self,
+                 path_integrator_factory: Callable[[Optional[MapBase],
+                 Optional[Boundary], int], MapBase],
+                 scattering_albedo: Optional[MapBase] = None,
+                 phase_sampler: Optional['PhaseSampler'] = None,
+                 emission: Optional[MapBase] = None,
+                 enclosed: bool = False,
+                 custom_boundary: Optional[Boundary] = None,
+                 volume_track: bool = True
+                 ):
         self.path_integrator_factory = path_integrator_factory
         self.scattering_albedo = scattering_albedo
         self.emission = emission
         self.phase_sampler = phase_sampler
         self.phase_sampler_pdf = None if phase_sampler is None else phase_sampler.get_pdf()
         self.enclosed = enclosed  # means that it will be assumed that the boundary it's not null
+        self.custom_boundary = custom_boundary
+        self.volume_track = volume_track
 
     def transmittance(self):
-        return self.path_integrator_factory(None, 0)
+        return self.path_integrator_factory(None, None, 0)
 
-    def only_emission(self):
-        return self.path_integrator_factory(None if self.emission is None else VolumeEmissionGathering(self.scattering_albedo, self.emission), 1)
+    # def only_emission(self):
+    #     return self.path_integrator_factory(None if self.emission is None else VolumeEmissionGathering(self.scattering_albedo, self.emission), 1)
+    #
+    # def only_scattering(self):
+    #     return self.path_integrator_factory(None, 2)
+    #
+    def default_gathering(self, boundaries: Boundary):
+        if self.custom_boundary is not None:
+            boundaries = self.custom_boundary
+        if not self.volume_track:
+            boundaries = None
+        return self.path_integrator_factory(
+            None if self.emission is None else VolumeEmissionGathering(
+                self.scattering_albedo, self.emission), boundaries, 3
+        )
 
-    def only_scattering(self):
-        return self.path_integrator_factory(None, 2)
-
-    def default_gathering(self):
-        return self.path_integrator_factory(None if self.emission is None else VolumeEmissionGathering(self.scattering_albedo, self.emission), 3)
-
-    def environment_gathering(self, environment_sampler: EnvironmentSampler, visibility: MapBase):
+    def environment_gathering(self, environment_sampler: EnvironmentSampler, visibility: MapBase, boundaries: Boundary):
+        if self.custom_boundary is not None:
+            boundaries = self.custom_boundary
+        if not self.volume_track:
+            boundaries = None
         nee_gathering = None if self.scattering_albedo is None or self.enclosed else VolumeEnvironmentGathering(
                                                 environment_sampler,
                                                 visibility,
@@ -2395,7 +2061,7 @@ class MediumMaterial:
             gathering = nee_gathering
         else:
             gathering = nee_gathering + self.emission
-        return self.path_integrator_factory(gathering, 3)
+        return self.path_integrator_factory(gathering, boundaries, 3)
         # return self.path_integrator_factory(None, 0)
 
     def photon_gathering(self, incomming_radiance: MapBase):
@@ -2420,21 +2086,65 @@ class HomogeneousMediumMaterial(MediumMaterial):
 
 
 class HeterogeneousMediumMaterial(MediumMaterial):
-    def __init__(self, sigma: MapBase, scattering_albedo: Optional[MapBase] = None, emission: Optional[MapBase]=None, phase_sampler: Optional['PhaseSampler'] = None, technique: Literal['dt', 'rt'] = 'dt', **kwargs):
+    def __init__(self,
+                 sigma: MapBase,
+                 scattering_albedo: Optional[MapBase] = None,
+                 emission: Optional[MapBase]=None,
+                 phase_sampler: Optional['PhaseSampler'] = None,
+                 technique: Literal['dt', 'ds', 'rt'] = 'dt',
+                 enclosed: bool = False,
+                 custom_boundary: Optional[Boundary] = None,
+                 volume_track: bool = True,
+                 **kwargs):
         if technique == 'dt':
             assert 'majorant' in kwargs, "Delta tracking technique requires a majorant: torch.Tensor parameter"
-            def factory(gathering, filter):
-                return DTMediumPathIntegrator(
-                    sigma=sigma,
-                    scattering_albedo=scattering_albedo,
-                    phase_sampler=phase_sampler,
-                    majorant=kwargs.get('majorant'),
-                    gathering=gathering,
-                    medium_filter=filter
-                )
+            def factory(gathering, boundaries, filter):
+                if boundaries is None:
+                    return DTMediumPathIntegrator(
+                        sigma=sigma,
+                        scattering_albedo=scattering_albedo,
+                        phase_sampler=phase_sampler,
+                        majorant=kwargs.get('majorant'),
+                        gathering=gathering,
+                        medium_filter=filter
+                    )
+                else:
+                    return DTVolumePathIntegrator(
+                        sigma=sigma,
+                        majorant=kwargs.get('majorant'),
+                        boundaries=boundaries,
+                        scattering_albedo=scattering_albedo,
+                        phase_sampler=phase_sampler,
+                        gathering=gathering,
+                        medium_filter=filter
+                    )
+        elif technique == 'ds':
+            assert 'majorant' in kwargs, "Defensive tracking technique requires a majorant: torch.Tensor parameter"
+            # assert 'ds_epsilon' in kwargs, "Defensive tracking technique requires a ds_epsilon: float parameter"
+            def factory(gathering, boundaries, filter):
+                if boundaries is None:
+                    return DTMediumPathIntegrator(
+                        sigma=sigma,
+                        scattering_albedo=scattering_albedo,
+                        phase_sampler=phase_sampler,
+                        majorant=kwargs.get('majorant'),
+                        gathering=gathering,
+                        medium_filter=filter
+                    )
+                else:
+                    return DSVolumePathIntegrator(
+                        sigma=sigma,
+                        majorant=kwargs.get('majorant'),
+                        boundaries=boundaries,
+                        scattering_albedo=scattering_albedo,
+                        phase_sampler=phase_sampler,
+                        gathering=gathering,
+                        medium_filter=filter,
+                        ds_epsilon=kwargs.get('ds_epsilon', 0.1)
+                    )
         elif technique == 'rt':
             assert 'majorant' in kwargs, "Delta tracking technique requires a majorant: torch.Tensor parameter"
-            def factory(gathering, filter):
+            def factory(gathering, boundaries, filter):
                 return RTMediumPathIntegrator(
                     sigma=sigma,
                     scattering_albedo=scattering_albedo,
@@ -2449,7 +2159,10 @@ class HeterogeneousMediumMaterial(MediumMaterial):
             path_integrator_factory=factory,
             scattering_albedo=scattering_albedo,
             phase_sampler=phase_sampler,
-            emission=emission
+            emission=emission,
+            custom_boundary=custom_boundary,
+            enclosed=enclosed,
+            volume_track=volume_track,
         )
 
 
@@ -2516,15 +2229,37 @@ class SceneVisibility(MapBase):
                 self.patch_info[i].outside_medium = 0 if omi == -1 else medium_integrator[omi].__bindable__.device_ptr
 
 
+class SceneTransmittance(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            visibility=MapBase,
+            environment=MapBase
+        ),
+        generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
+        path=__INCLUDE_PATH__ + '/maps/scene_transmittance.h',
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.WITH_OUTPUT,
+    )
+
+    def __init__(self,
+                 visibility: MapBase,
+                 environment: MapBase
+                 ):
+        super().__init__()
+        self.visibility = visibility
+        self.environment = environment
+
+
 class PathtracedScene(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             surfaces=MapBase,
             boundaries=MapBase,
             environment=MapBase,
+            direct_gathering=MapBase,
             patch_info=[-1, PTPatchInfo]
         ),
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
         dynamics=[
             SurfaceScatteringSampler.signature(),
             SurfaceGathering.signature(),
@@ -2535,16 +2270,18 @@ class PathtracedScene(MapBase):
     def __init__(self,
         surfaces: Geometry,
         environment: MapBase,
+        direct_gathering: MapBase,
         surface_gathering: Optional[List[SurfaceGathering]] = None,
         surface_scattering_sampler: Optional[List[SurfaceScatteringSampler]] = None,
         medium_integrator: Optional[List[MediumPathIntegrator]] = None,
         inside_medium_indices: Optional[List[int]] = None,
-        outside_medium_indices: Optional[List[int]] = None,
+        outside_medium_indices: Optional[List[int]] = None
     ):
         super().__init__(len(surfaces))
         self.surfaces = surfaces
         self.boundaries = surfaces.get_boundary()
         self.environment = environment
+        self.direct_gathering = direct_gathering
         for i in range(len(surfaces)):
             self.patch_info[i].surface_scattering_sampler = 0
             self.patch_info[i].surface_gathering = 0
@@ -2559,7 +2296,7 @@ class PathtracedScene(MapBase):
         if surface_gathering is not None:
             for i, sg in enumerate(surface_gathering):
                 self.patch_info[i].surface_gathering = 0 if sg is None else sg.__bindable__.device_ptr
-        self.media_modules = medium_integrator
+        self.media_modules = torch.nn.ModuleList(medium_integrator)
         assert inside_medium_indices is None or len(inside_medium_indices) == len(surfaces)
         if inside_medium_indices is not None:
             for i, imi in enumerate(inside_medium_indices):
@@ -2580,6 +2317,7 @@ class Scene:
                  outside_media: Optional[List[MediumMaterial]] = None
                  ):
         self.surfaces = surfaces
+        self.boundaries = surfaces.get_boundary()
         self.environment_sampler = environment_sampler
         self.materials = materials
         self.media = []
@@ -2594,7 +2332,7 @@ class Scene:
         self.inside_media = None if inside_media is None else [-1 if m is None else self.media.index(m) for m in inside_media]
         self.outside_media = None if outside_media is None else [-1 if m is None else self.media.index(m) for m in outside_media]
         self.scene_visibility = SceneVisibility(
-            boundaries=self.surfaces.get_boundary(),
+            boundaries=self.boundaries,
             surface_scatters=None if self.materials is None else [
                 False if m is None or isinstance(m, NoSurfaceScatteringSampler) else True for m in self.materials
             ],
@@ -2604,6 +2342,7 @@ class Scene:
             inside_medium_indices=self.inside_media,
             outside_medium_indices=self.outside_media
         )
+        self.transmittance_map = SceneTransmittance(self.scene_visibility, self.environment_sampler.get_environment())
 
     @staticmethod
     def from_graph(
@@ -2665,6 +2404,7 @@ class Scene:
         return PathtracedScene(
             surfaces=self.surfaces,
             environment=self.environment_sampler.get_environment(),
+            direct_gathering=constant(6, 0.0, 0.0, 0.0),
             surface_gathering=None if self.materials is None else [
                 None if m is None else m.emission_gathering() for m in self.materials
             ],
@@ -2672,17 +2412,18 @@ class Scene:
                 None if m is None else m.sampler for m in self.materials
             ],
             medium_integrator=None if self.media is None else [
-                None if m is None else m.default_gathering() for m in self.media
+                None if m is None else m.default_gathering(boundaries=self.boundaries) for m in self.media
             ],
             inside_medium_indices=self.inside_media,
             outside_medium_indices=self.outside_media
         )
 
     def pathtrace_environment_nee(self) -> MapBase:
-        return self.transmittance() + PathtracedScene(
+        return PathtracedScene(
             surfaces=self.surfaces,
             # environment=ray_direction(),
             environment=constant(6, 0.0, 0.0, 0.0),
+            direct_gathering=self.transmittance(),
             surface_gathering=None if self.materials is None else [
                 # None if m is None else m.emission_gathering() for m in self.materials
                 # None for m in self.materials
@@ -2692,7 +2433,9 @@ class Scene:
                 None if m is None else m.sampler for m in self.materials
             ],
             medium_integrator=None if self.media is None else [
-                None if m is None else m.environment_gathering(self.environment_sampler, self.visibility()) for m in self.media
+                None if m is None else m.environment_gathering(
+                    self.environment_sampler, self.visibility(), boundaries=self.boundaries
+                ) for m in self.media
                 # None if m is None else m.default_gathering() for m in self.media
         ],
             inside_medium_indices=self.inside_media,
@@ -2700,7 +2443,8 @@ class Scene:
         )
 
     def transmittance(self) -> MapBase:
-        return self.visibility().after(ray_to_segment(constant(6, 10000.0))).promote(3) * self.environment_sampler.get_environment()
+        return self.transmittance_map
+        # return self.visibility().after(ray_to_segment(constant(6, 10000.0))).promote(3) * self.environment_sampler.get_environment()
 
 
 # class Medium(MapBase):

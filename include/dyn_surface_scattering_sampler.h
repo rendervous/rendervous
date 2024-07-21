@@ -2,7 +2,7 @@
 Represents objects that can scatter in surfaces.
 */
 
-void sample_surface_scattering(map_object, GPUPtr scattering_map, vec3 w, Surfel hit, out vec3 wo, out vec3 W, out float pdf)
+void surface_scattering_sampler(map_object, GPUPtr scattering_map, vec3 w, Surfel hit, out vec3 wo, out vec3 W, out float pdf)
 {
     float _input[20] = float[20](
         w.x, w.y, w.z,
