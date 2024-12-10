@@ -125,8 +125,8 @@ void path_integrator_NEE_SPS_bw(map_object, vec3 x, vec3 w, vec3 dL_dR)
     vec3 dL_ddirectenv = dL_dR * direct_T;
     float dL_ddirectT = dot(dL_dR, direct_environment);
     SWITCH_SEED(main_seed, secondary_seed);
-    environment_bw(object, w, dL_ddirectenv);
     transmittance_bw(object, x, w, dL_ddirectT);
+    environment_bw(object, w, dL_ddirectenv);
     SWITCH_SEED(secondary_seed, main_seed);
 
     // Accumulated radiance along the primary path
@@ -140,7 +140,8 @@ void path_integrator_NEE_SPS_bw(map_object, vec3 x, vec3 w, vec3 dL_dR)
     vec3 ini_w = w;
     float ini_d = d;
 
-    float EPS = 0.00000001;
+    //float EPS = 0.00000001;
+    float EPS = 0.00001;
 
     SAVE_SEED(before_path);
 
@@ -206,7 +207,7 @@ void path_integrator_NEE_SPS_bw(map_object, vec3 x, vec3 w, vec3 dL_dR)
         vec3 further_R = R + W_singular * Rf;
         float k = dot(dL_dR, further_R);
         float dL_dtau = -k;
-        float dL_dsigma = singular_vertex ? dot(dL_dR, Rf) : k / max(0.000001, sigma_xc); // to avoid outliers
+        float dL_dsigma = singular_vertex ? dot(dL_dR, Rf) : k / max(0.001, sigma_xc); // to avoid outliers
         // R = <T(x, xc)> * further_R
 
         x = xc;

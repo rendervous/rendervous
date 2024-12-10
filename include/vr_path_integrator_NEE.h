@@ -13,7 +13,7 @@ vec3 path_integrator_NEE(map_object, vec3 x, vec3 w, bool only_scatters)
     if (!only_scatters)
         R += transmittance(object, x, w) * environment(object, w);
 
-    float EPS = 0.00000001;
+    float EPS = 0.00001;
 
     while (d > EPS)
     {

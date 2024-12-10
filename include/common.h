@@ -196,6 +196,84 @@ float atomicAdd_f(float_ptr buf, int index, float value)
 
 #define IS_NULL(x) (GPUPtr(x) == 0)
 
+#define REQUIRES_LINEAR(in_features, out_features) \
+void linear_fw(map_object, in float x[(in_features)], out float y[(out_features)], GPUPtr weights, GPUPtr bias) { \
+    float_ptr weights_buffer = float_ptr(weights); \
+    float_ptr bias_buffer = float_ptr(bias); \
+    int cw = 0; \
+    int cb = 0; \
+    [[unroll]] for (int i = 0; i < out_features; i++) { \
+        y[i] = 0.0; \
+        [[unroll]] for (int j=0; j<in_features; j++) y[i] += x[j] * weights_buffer.data[cw++]; \
+        if (bias != 0) y[i] += bias_buffer.data[cb++]; \
+    } \
+} \
+void linear_bw(map_object, in float x[in_features], in float de_dy[out_features], out float de_dx[in_features], GPUPtr weights, GPUPtr bias, GPUPtr de_dweights, GPUPtr de_dbias) { \
+    [[unroll]] for (int j=0; j < in_features; j++) de_dx[j] = 0; \
+    float_ptr weights_buffer = float_ptr(weights); \
+    float_ptr dweight_buffer = float_ptr(de_dweights); \
+    int N = out_features * in_features; \
+    [[unroll]] for (int c = 0; c < N; c++) { \
+        int i = c / in_features; \
+        int j = c % in_features; \
+        de_dx[j] += de_dy[i] * weights_buffer.data[c]; \
+        atomicAdd_f(dweight_buffer, c, de_dy[i] * x[j]); \
+    } \
+    float_ptr dbias_buffer = float_ptr(de_dbias); \
+    [[unroll]] for (int i=0; i<out_features; i++) atomicAdd_f(dbias_buffer, i, de_dy[i]); \
+}
+
+
+#define REQUIRES_MATMUL(in_features, out_features) \
+void matmul_fw(map_object, in float x[(in_features)], out float y[(out_features)], GPUPtr weights) { \
+    float_ptr weights_buffer = float_ptr(weights); \
+    int cw = 0; \
+    [[unroll]] for (int i = 0; i < out_features; i++) y[i] = 0.0;\
+    [[unroll]] for (int j = 0; j < in_features; j++) \
+    [[unroll]] for (int i = 0; i < out_features; i++) { \
+         y[i] += x[j] * weights_buffer.data[cw++]; \
+    } \
+} \
+void matmul_bw(map_object, in float x[in_features], in float de_dy[out_features], inout float de_dx[in_features], GPUPtr weights, GPUPtr de_dweights) { \
+    float_ptr weights_buffer = float_ptr(weights); \
+    float_ptr dweight_buffer = float_ptr(de_dweights); \
+    int N = out_features * in_features; \
+    [[unroll]] for (int c = 0; c < N; c++) { \
+        int j = c / out_features; \
+        int i = c % out_features; \
+        de_dx[j] += de_dy[i] * weights_buffer.data[c]; \
+        atomicAdd_f(dweight_buffer, c, de_dy[i] * x[j]); \
+    } \
+}\
+void pre_matmul_fw(map_object, in float x[(in_features)], out float y[(out_features)], GPUPtr weights) { \
+    float_ptr weights_buffer = float_ptr(weights); \
+    int cw = 0; \
+    [[unroll]] for (int i = 0; i < out_features; i++) { \
+    y[i] = 0.0;\
+    [[unroll]] for (int j = 0; j < in_features; j++) \
+         y[i] += x[j] * weights_buffer.data[cw++]; \
+    } \
+} \
+void pre_matmul_bw(map_object, in float x[in_features], in float de_dy[out_features], inout float de_dx[in_features], GPUPtr weights, GPUPtr de_dweights) { \
+    float_ptr weights_buffer = float_ptr(weights); \
+    float_ptr dweight_buffer = float_ptr(de_dweights); \
+    int N = out_features * in_features; \
+    [[unroll]] for (int c = 0; c < N; c++) { \
+        int i = c / in_features; \
+        int j = c % in_features; \
+        de_dx[j] += de_dy[i] * weights_buffer.data[c]; \
+        atomicAdd_f(dweight_buffer, c, de_dy[i] * x[j]); \
+    } \
+}
+
+
+#define ACTIVATION_FUNCTION \
+float activation_fw(map_object, float x); \
+void activation_bw(map_object, float x, float dL_dy, inout float dL_dx); \
+FORWARD { [[unroll]] for (int i=0; i<INPUT_DIM; i++) _output[i] = activation_fw(object, _input[i]); } \
+BACKWARD { [[unroll]] for (int i=0; i<INPUT_DIM; i++) activation_bw(object, _input[i], _output_grad[i], _input_grad[i]); }
+
+
 struct Surfel
 {
     vec3 P; // Position at the surface

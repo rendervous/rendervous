@@ -106,7 +106,8 @@ void scene_visibility_bw(map_object, vec3 xa, vec3 xb, float out_T, float dL_dT)
             vec3 dL_dW = vec3(dL_dT * out_T / vT)/3;
             dL_dW = mix(dL_dW, vec3(0.0), isnan(dL_dW));
             SET_SEED(before_traversal)
-            medium_traversal_bw(object, current_medium, x, w, vd, vW, vA, dL_dW, vec3(0.0));
+            medium_traversal_bw(object, current_medium, x, w, vd, dL_dW, vec3(0.0));
+            // medium_traversal_bw(object, current_medium, x, w, vd, vW, vA, dL_dW, vec3(0.0));
 
             ASSERT(get_seed() == SEED(after_traversal), "sc_scene_visibility.h: Seed inconsistency during medium traversal")
 
@@ -193,8 +194,10 @@ float scene_visibility(map_object, vec3 xa, vec3 xb)
         return T;
 
         // Check scatter at surface
-        if (T < 0.000001 || patch_info.surface_scatters != 0)
-            return 0; // surface between xa-xb
+        if (T < 0.000001) return 0.0;
+
+        if (patch_info.surface_scatters != 0)
+            return 0.0; // surface between xa-xb
 
         if (is_entering)
         { // stack current medium and change for patch_info

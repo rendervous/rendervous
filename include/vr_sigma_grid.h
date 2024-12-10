@@ -51,6 +51,11 @@ void add_interpolated_sigma_bw(map_object, vec3 alpha, float dL_dsigma, inout fl
     dL_dcell[1][1][1] += dL_dsigma * (alpha.x)*(alpha.y)*(alpha.z);
 }
 
+bool sigma_grid_has_grad(map_object)
+{
+    return parameters.grid.grad_data != 0;
+}
+
 void sigma_at_bw(map_object, ivec3 cell, float dL_dg)
 {
     ivec3 dim = ivec3(parameters.grid.shape[2] - 1, parameters.grid.shape[1] - 1, parameters.grid.shape[0] - 1);

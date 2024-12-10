@@ -1,26 +1,21 @@
-from ._internal import DependencySet, DependentObject, vec3, device, mat3
-from ._maps import ray_position, Grid2D, Grid3D, MapBase, xr_projection, Image2D, XRQuadtreeRandomDirection, \
-    FunctionSampler, SH_PDF, \
-    UniformDirectionSampler, normalized_box, RayBoxIntersection, constant, ConstantMap, GridRatiotrackingTransmittance, \
-    ray_direction, \
-    PerspectiveCameraSensor, RatiotrackingTransmittance, DeltatrackingTransmittance, GridDeltatrackingTransmittance, \
-    GridDDATransmittance, RaymarchingTransmittance, HGPhase, HGDirectionSampler, identity, VHGPhaseSampler, \
-    DeltatrackingCollisionSampler, MCCollisionIntegrator, MCScatteredRadiance, MCScatteredEmittedRadiance, \
-    DeltatrackingPathIntegrator, DeltatrackingNEEPathIntegrator, DRTPathIntegrator, SPSPathIntegrator, \
-    DRTDSPathIntegrator, DRTQPathIntegrator, GridDDACollisionIntegrator
-from ._functions import gridtoimg, resample_img, create_density_quadtree
+import vulky as vk
+from . import _internal
+from . import vec3, vec2
+from . import _maps
+from . import _functions
 import torch
-from typing import Callable, Union, Optional, Literal, List, Tuple
+import typing
+# from typing import Callable, Union, Optional, Literal, List, Tuple
 import numpy as np
 
 
-def medium_box_AABB(ds: DependencySet, *, bmin: vec3 = vec3(-1.0, -1.0, -1.0), bmax: vec3 = vec3(1.0, 1.0, 1.0)):
+def medium_box_AABB(ds: _internal.DependencySet, *, bmin: vec3 = vec3(-1.0, -1.0, -1.0), bmax: vk.vec3 = vk.vec3(1.0, 1.0, 1.0)):
     ds.add_parameters(box=(bmin, bmax))
 
-def medium_box_normalized(ds: DependencySet, *, t: Union[torch.Tensor, List[int]]):
-    ds.add_parameters(box=normalized_box(t))
+def medium_box_normalized(ds: _internal.DependencySet, *, t: typing.Union[torch.Tensor, typing.List[int]]):
+    ds.add_parameters(box=_maps.normalized_box(t))
 
-def medium_box(ds: DependencySet):
+def medium_box(ds: _internal.DependencySet):
     '''
     Ensures a box parameter with AABB limits for the volume.
     '''
@@ -30,131 +25,135 @@ def medium_box(ds: DependencySet):
         ds.assert_ensures('sigma_tensor', torch.Tensor)
         medium_box_normalized(ds, t = ds.sigma_tensor)
     except:
-        print("[WARNING] Grid3D sigma not found, -1..1 box used instead.")
-        medium_box_AABB(ds)
+        try:
+            ds.assert_ensures('sigma', _maps.Grid3D)
+            medium_box_normalized(ds, t=ds.sigma.grid)
+        except:
+            print("[WARNING] Neither Grid3D sigma nor tensor was found, -1..1 box used instead.")
+            medium_box_AABB(ds)
 
-def medium_boundary_box(ds: DependencySet):
+def medium_boundary_box(ds: _internal.DependencySet):
     ds.requires(medium_box)
     bmin, bmax = ds.box
-    ds.add_parameters(boundary=RayBoxIntersection(bmin, bmax))
+    ds.add_parameters(boundary=_maps.RayBoxIntersection(bmin, bmax))
 
-def medium_boundary(ds: DependencySet):
+def medium_boundary(ds: _internal.DependencySet):
     '''
     Ensures a boundary map by means of raycast (x,w) -> (tMin, tMax).
     If necessary, creates a ray-box intersection with box.
     '''
-    if ds.ensures('boundary', MapBase):
+    if ds.ensures('boundary', _maps.MapBase):
         return
     medium_boundary_box(ds)
 
-def build_map_from_tensor(ds: DependencySet, *, field_name: str):
+def build_map_from_tensor(ds: _internal.DependencySet, *, field_name: str):
     ds.requires(medium_box)
     bmin, bmax = ds.box
     ds.assert_ensures(field_name + "_tensor", torch.Tensor)
     tensor = getattr(ds, field_name + "_tensor")
     if len(tensor.shape) == 1:
-        return ConstantMap(3, tensor)
+        return _maps.const[tensor]
     else:
-        return Grid3D(tensor, bmin, bmax)
+        return _maps.Grid3D(tensor, bmin, bmax)
 
-def medium_sigma_tensor(ds: DependencySet):
+def medium_sigma_tensor(ds: _internal.DependencySet):
     ds.add_parameters(sigma=build_map_from_tensor(ds, field_name='sigma'))
 
-def medium_sigma(ds: DependencySet):
-    if ds.ensures('sigma', MapBase):
+def medium_sigma(ds: _internal.DependencySet):
+    if ds.ensures('sigma', _maps.MapBase):
         return
     medium_sigma_tensor(ds)
 
-def medium_scattering_albedo_tensor(ds: DependencySet):
+def medium_scattering_albedo_tensor(ds: _internal.DependencySet):
     ds.add_parameters(scattering_albedo=build_map_from_tensor(ds, field_name='scattering_albedo'))
 
-def medium_scattering_albedo(ds: DependencySet):
-    if ds.ensures('scattering_albedo', MapBase):
+def medium_scattering_albedo(ds: _internal.DependencySet):
+    if ds.ensures('scattering_albedo', _maps.MapBase):
         return
     medium_scattering_albedo_tensor(ds)
 
-def medium_emission_tensor(ds: DependencySet):
+def medium_emission_tensor(ds: _internal.DependencySet):
     emission_grid = build_map_from_tensor(ds, field_name='emission')
-    ds.add_parameters(emission=SH_PDF(3, emission_grid))
+    ds.add_parameters(emission=_maps.SH_PDF(3, emission_grid))
     
-def medium_emission(ds: DependencySet):
-    if ds.ensures('emission', MapBase):
+def medium_emission(ds: _internal.DependencySet):
+    if ds.ensures('emission', _maps.MapBase):
         return
     medium_emission_tensor(ds)
     
-def medium_phase_g_tensor(ds: DependencySet):
+def medium_phase_g_tensor(ds: _internal.DependencySet):
     ds.add_parameters(phase_g=build_map_from_tensor(ds, field_name='phase_g'))
 
-def medium_phase_g(ds: DependencySet):
-    if ds.ensures('phase_g', MapBase):
+def medium_phase_g(ds: _internal.DependencySet):
+    if ds.ensures('phase_g', _maps.MapBase):
         return
     medium_phase_g_tensor(ds)
 
 def medium_majorant_tensor(ds):
     ds.assert_ensures('majorant_tensor', torch.Tensor)
-    ds.add_parameters(majorant=ConstantMap(6, ds.majorant_tensor))
+    ds.add_parameters(majorant=_maps.const[ds.majorant_tensor])
 
-def medium_majorant_grid(ds: DependencySet):
+def medium_majorant_grid(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
-    ds.assert_ensures('sigma', Grid3D)
-    g: Grid3D = ds.sigma
-    ds.add_parameters(majorant_tensor=lambda: torch.tensor([g.get_maximum(), 1000000.0], device=device()))
-    ds.add_parameters(majorant=ConstantMap(6, ds.majorant_tensor))
+    ds.assert_ensures('sigma', _maps.Grid3D)
+    g: _maps.Grid3D = ds.sigma
+    ds.add_parameters(majorant_tensor=lambda: torch.tensor([g.get_maximum(), 1000000.0], device=_internal.device()))
+    ds.add_parameters(majorant=_maps.const[ds.majorant_tensor])
 
-def medium_majorant(ds: DependencySet):
+def medium_majorant(ds: _internal.DependencySet):
     '''
     Ensures a majorant map (x, w) -> (majorant, distance).
     By default assumes a Grid3D sigma can be reached.
     '''
-    if ds.ensures('majorant', MapBase):
+    if ds.ensures('majorant', _maps.MapBase):
         return
     try:
         medium_majorant_tensor(ds)
     except:
-        print("[WARNING] majorant tensor not found, trying to get it from a Grid3D sigma")
+        # print("[WARNING] majorant tensor not found, trying to get it from a Grid3D sigma")
         medium_majorant_grid(ds)
 
-def medium_transmittance_GDT(ds: DependencySet):
+def medium_transmittance_GDT(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
-    ds.assert_ensures('sigma', Grid3D)
-    ds.add_parameters(transmittance=GridDeltatrackingTransmittance(ds.sigma, ds.boundary))
+    ds.assert_ensures('sigma', _maps.Grid3D)
+    ds.add_parameters(transmittance=_maps.GridDeltatrackingTransmittance(ds.sigma, ds.boundary))
 
-def medium_transmittance_GRT(ds: DependencySet):
+def medium_transmittance_GRT(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
-    ds.assert_ensures('sigma', Grid3D)
-    ds.add_parameters(transmittance=GridRatiotrackingTransmittance(ds.sigma, ds.boundary))
+    ds.assert_ensures('sigma', _maps.Grid3D)
+    ds.add_parameters(transmittance=_maps.GridRatiotrackingTransmittance(ds.sigma, ds.boundary))
 
-def medium_transmittance_DDA(ds: DependencySet):
+def medium_transmittance_DDA(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
-    ds.assert_ensures('sigma', Grid3D)
-    ds.add_parameters(transmittance=GridDDATransmittance(ds.sigma, ds.boundary))
+    ds.assert_ensures('sigma', _maps.Grid3D)
+    ds.add_parameters(transmittance=_maps.GridDDATransmittance(ds.sigma, ds.boundary))
 
-def medium_transmittance_RM(ds: DependencySet, *, step: float = 0.05):
+def medium_transmittance_RM(ds: _internal.DependencySet, *, step: float = 0.05):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
-    ds.add_parameters(transmittance=RaymarchingTransmittance(ds.sigma, ds.boundary, step=step))
+    ds.add_parameters(transmittance=_maps.RaymarchingTransmittance(ds.sigma, ds.boundary, step=step))
 
-def medium_transmittance_DT(ds: DependencySet):
-    ds.requires(medium_sigma)
-    ds.requires(medium_boundary)
-    ds.requires(medium_majorant)
-    ds.add_parameters(transmittance=DeltatrackingTransmittance(ds.sigma, ds.boundary, ds.majorant))
-
-def medium_transmittance_RT(ds: DependencySet):
+def medium_transmittance_DT(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
-    ds.add_parameters(transmittance=RatiotrackingTransmittance(ds.sigma, ds.boundary, ds.majorant))
+    ds.add_parameters(transmittance=_maps.DeltatrackingTransmittance(ds.sigma, ds.boundary, ds.majorant))
 
-def medium_transmittance(ds: DependencySet):
+def medium_transmittance_RT(ds: _internal.DependencySet):
+    ds.requires(medium_sigma)
+    ds.requires(medium_boundary)
+    ds.requires(medium_majorant)
+    ds.add_parameters(transmittance=_maps.RatiotrackingTransmittance(ds.sigma, ds.boundary, ds.majorant))
+
+def medium_transmittance(ds: _internal.DependencySet):
     '''
     Ensures a transmittance map.
     By default Ratiotracking technique is used
     '''
-    if ds.ensures('transmittance', MapBase):
+    if ds.ensures('transmittance', _maps.MapBase):
         return
     try:
         medium_transmittance_RT(ds)
@@ -162,86 +161,82 @@ def medium_transmittance(ds: DependencySet):
         print("[WARNING] fields for ratio-tracking transmittance not found, trying DDA instead")
         medium_transmittance_DDA(ds)
 
-def medium_environment_tensor(ds: DependencySet, *, projection: Literal['sph', 'cyl', 'xr', 'cube'] = 'xr'):
+def medium_environment_tensor(ds: _internal.DependencySet, *, projection: typing.Literal['sph', 'cyl', 'xr', 'cube'] = 'xr'):
     ds.assert_ensures("environment_tensor", torch.Tensor)
     t = ds.environment_tensor
     if len(t.shape) == 1:  # constant
-        ds.add_parameters(environment=ConstantMap(3, ds.environment_tensor))
+        ds.add_parameters(environment=_maps.const[ds.environment_tensor])
     else:
         projection = {
-            'xr': xr_projection(),
+            'xr': _maps.xr_projection,
         }[projection]
-        ds.add_parameters(environment=Image2D(ds.environment_tensor).after(projection))
+        ds.add_parameters(environment=_maps.Image2D(ds.environment_tensor).after(projection))
 
-def medium_environment(ds: DependencySet):
-    if ds.ensures('environment', MapBase):
+def medium_environment(ds: _internal.DependencySet):
+    if ds.ensures('environment', _maps.MapBase):
         return
     medium_environment_tensor(ds)
 
-def medium_environment_sampler_quadtree(ds: DependencySet, *, projection: Literal['sph', 'cyl', 'xr', 'cube'] = 'xr', levels: int = 10):
+def medium_environment_sampler_quadtree(ds: _internal.DependencySet, *, projection: typing.Literal['sph', 'cyl', 'xr', 'cube'] = 'xr', levels: int = 10):
     ds.requires(medium_environment_tensor, projection=projection)
     if projection == 'xr':
         skybox_img = ds.environment_tensor
         def build_quadtree():
             with torch.no_grad():
                 resolution = 1 << levels
-                densities = resample_img(skybox_img.sum(-1, keepdim=True), (resolution, resolution))
+                densities = _functions.resample_img(skybox_img.sum(-1, keepdim=True), (resolution, resolution))
                 for py in range(resolution):
                     w = np.cos(py * np.pi / resolution) - np.cos((py + 1) * np.pi / resolution)
                     densities[py, :, :] *= w
                 densities /= max(densities.sum(), 0.00000001)
-                return create_density_quadtree(densities)
+                return _functions.create_density_quadtree(densities)
 
         ds.add_parameters(environment_sampler_quadtree=build_quadtree)
-        dir_sampling = XRQuadtreeRandomDirection(input_dim=6, densities=ds.environment_sampler_quadtree,
+        dir_sampling = _maps.XRQuadtreeRandomDirection(input_dim=6, densities=ds.environment_sampler_quadtree,
                                                  levels=levels)
-        ds.add_parameters(environment_sampler=FunctionSampler(point_sampler=dir_sampling, function_map=ds.environment))
+        ds.add_parameters(environment_sampler=_maps._functionsampler(point_sampler=dir_sampling, function_map=ds.environment))
     else:
         raise Exception(f'Not supported quadtree creation from projection {projection}')
 
-def medium_environment_sampler_uniform(ds: DependencySet):
+def medium_environment_sampler_uniform(ds: _internal.DependencySet):
     ds.includes(medium_environment)
-    dir_sampling = UniformDirectionSampler(3)
-    ds.add_parameters(environment_sampler=FunctionSampler(point_sampler=dir_sampling, function_map=ds.environment))
+    dir_sampling = _maps.UniformDirectionSampler(3)
+    ds.add_parameters(environment_sampler=_maps._functionsampler(point_sampler=dir_sampling, function_map=ds.environment))
 
-def medium_environment_sampler(ds: DependencySet):
-    if ds.ensures('environment_sampler', MapBase):
+def medium_environment_sampler(ds: _internal.DependencySet):
+    if ds.ensures('environment_sampler', _maps.MapBase):
         return
     try:
         medium_environment_sampler_quadtree(ds)
     except Exception as e:
         print(f"[WARNING] Quadtree sampler for environment could not be created. {e}. Using uniform sampling instead.")
 
-def medium_phase_iso(ds: DependencySet):
-    ds.add_parameters(phase=constant(9, 1.0 / (4 * np.pi)))
+def medium_phase_iso(ds: _internal.DependencySet):
+    ds.add_parameters(phase=_maps.const[1.0 / (4 * np.pi)])
 
-def medium_phase_HG(ds: DependencySet):
+def medium_phase_HG(ds: _internal.DependencySet):
     ds.requires(medium_phase_g)
-    ds.add_parameters(phase=HGPhase(ds.phase_g))
+    ds.add_parameters(phase=_maps.HGPhase(ds.phase_g))
 
-def medium_phase(ds: DependencySet):
-    if not ds.ensures('phase', MapBase):
+def medium_phase(ds: _internal.DependencySet):
+    if not ds.ensures('phase', _maps.MapBase):
         try:
             medium_phase_HG(ds)
         except:
             print("[WARNING] a HG phase could not be created, assuming isotropic instead.")
             medium_phase_iso(ds)
-    assert ds.phase.input_dim == 9
-    assert ds.phase.output_dim == 1
 
-def medium_phase_sampler_uniform(ds: DependencySet):
-    dir_sampling = UniformDirectionSampler(6)
+def medium_phase_sampler_uniform(ds: _internal.DependencySet):
+    dir_sampling = _maps.UniformDirectionSampler(6)
     ds.requires(medium_phase)
-    ds.add_parameters(phase_sampler=FunctionSampler(identity(6) | dir_sampling, ds.phase)[0, 7, 8, 9])
-    assert ds.phase_sampler.input_dim == 6
-    assert ds.phase_sampler.output_dim == 4
+    ds.add_parameters(phase_sampler=_maps._functionsampler(_maps.identity(6) | dir_sampling, ds.phase.cast(9,1))[0, 7, 8, 9])
 
-def medium_phase_sampler_HG(ds: DependencySet):
+def medium_phase_sampler_HG(ds: _internal.DependencySet):
     ds.requires(medium_phase_g)
-    ds.add_parameters(phase_sampler=VHGPhaseSampler(ds.phase_g))
+    ds.add_parameters(phase_sampler=_maps.VHGPhaseSampler(ds.phase_g))
 
-def medium_phase_sampler(ds: DependencySet):
-    if ds.ensures('phase_sampler', MapBase):
+def medium_phase_sampler(ds: _internal.DependencySet):
+    if ds.ensures('phase_sampler', _maps.MapBase):
         return
     try:
         medium_phase_sampler_HG(ds)
@@ -249,26 +244,26 @@ def medium_phase_sampler(ds: DependencySet):
         print("[WARNING] a HG phase sampler could not be created, assuming isotropic instead.")
         medium_phase_sampler_uniform(ds)
 
-def medium_collision_sampler_DT(ds: DependencySet, *, ds_epsilon: float = 0.1):
+def medium_collision_sampler_DT(ds: _internal.DependencySet, *, ds_epsilon: float = 0.1):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
-    ds.add_parameters(collision_sampler=DeltatrackingCollisionSampler(ds.sigma, ds.boundary, ds.majorant, ds_epsilon))
+    ds.add_parameters(collision_sampler=_maps.DeltatrackingCollisionSampler(ds.sigma, ds.boundary, ds.majorant, ds_epsilon))
 
-def medium_collision_sampler(ds: DependencySet):
+def medium_collision_sampler(ds: _internal.DependencySet):
     medium_collision_sampler_DT(ds)
 
-def medium_radiance_transmitted(ds: DependencySet):
+def medium_radiance_transmitted(ds: _internal.DependencySet):
     ds.requires(medium_transmittance)
     ds.requires(medium_environment)
-    ds.add_parameters(radiance=ds.transmittance * ds.environment.after(ray_direction()))
+    ds.add_parameters(radiance=ds.transmittance * ds.environment.after(_maps.ray_direction()))
 
-def medium_exitance_radiance_emission(ds: DependencySet):
+def medium_exitance_radiance_emission(ds: _internal.DependencySet):
     ds.requires(medium_emission)
     ds.add_parameters(exitance_radiance=ds.emission)
 
-def medium_exitance_radiance(ds: DependencySet):
-    if ds.ensures('exitance_radiance', MapBase):
+def medium_exitance_radiance(ds: _internal.DependencySet):
+    if ds.ensures('exitance_radiance', _maps.MapBase):
         return
     try:
         ds.requires(medium_scattering_albedo)
@@ -284,48 +279,48 @@ def medium_exitance_radiance(ds: DependencySet):
         ds.requires(medium_phase_sampler)
         ds.requires(medium_radiance)
         if not has_emission:
-            exitance_radiance = MCScatteredRadiance(ds.scattering_albedo, ds.phase_sampler, ds.radiance)
+            exitance_radiance = _maps.MCScatteredRadiance(ds.scattering_albedo, ds.phase_sampler, ds.radiance)
         else:
-            exitance_radiance = MCScatteredEmittedRadiance(ds.scattering_albedo, ds.emission, ds.phase_sampler, ds.radiance)
+            exitance_radiance = _maps.MCScatteredEmittedRadiance(ds.scattering_albedo, ds.emission, ds.phase_sampler, ds.radiance)
     else:
         if not has_emission:
-            exitance_radiance = constant(6, 0.0, 0.0, 0.0)
+            exitance_radiance = _maps.ZERO
         else:
             exitance_radiance = ds.emission
     ds.add_parameters(exitance_radiance=exitance_radiance)
 
-def medium_radiance_collision_integrator_MC(ds: DependencySet):
+def medium_radiance_collision_integrator_MC(ds: _internal.DependencySet):
     ds.requires(medium_collision_sampler)
     ds.requires(medium_environment)
     ds.requires(medium_exitance_radiance)
-    ds.add_parameters(radiance=MCCollisionIntegrator(ds.collision_sampler, ds.exitance_radiance, ds.environment))
+    ds.add_parameters(radiance=_maps.MCCollisionIntegrator(ds.collision_sampler, ds.exitance_radiance, ds.environment))
 
-def medium_radiance_collision_integrator_RM(ds: DependencySet):
+def medium_radiance_collision_integrator_RM(ds: _internal.DependencySet):
     pass
 
-def medium_radiance_collision_integrator_DDA(ds: DependencySet):
+def medium_radiance_collision_integrator_DDA(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     ds.requires(medium_boundary)
-    ds.assert_ensures('sigma', Grid3D)
+    ds.assert_ensures('sigma', _maps.Grid3D)
     ds.requires(medium_environment)
     ds.requires(medium_exitance_radiance)
-    ds.add_parameters(radiance=GridDDACollisionIntegrator(ds.sigma, ds.exitance_radiance, ds.environment, ds.boundary))
+    ds.add_parameters(radiance=_maps.GridDDACollisionIntegrator(ds.sigma, ds.exitance_radiance, ds.environment, ds.boundary))
 
-def medium_radiance_path_integrator_DT(ds: DependencySet, *, ds_epsilon: float = 0.1):
+def medium_radiance_path_integrator_DT(ds: _internal.DependencySet, *, ds_epsilon: float = 0.1):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
     ds.requires(medium_phase_sampler)
-    ds.add_parameters(radiance = DeltatrackingPathIntegrator(
+    ds.add_parameters(radiance = _maps.DeltatrackingPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -336,16 +331,16 @@ def medium_radiance_path_integrator_DT(ds: DependencySet, *, ds_epsilon: float =
         ds_epsilon
     ))
 
-def medium_radiance_path_integrator_NEE_DT(ds: DependencySet, *, ds_epsilon: float = 0.1):
+def medium_radiance_path_integrator_NEE_DT(ds: _internal.DependencySet, *, ds_epsilon: float = 0.1):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
@@ -353,7 +348,7 @@ def medium_radiance_path_integrator_NEE_DT(ds: DependencySet, *, ds_epsilon: flo
     ds.requires(medium_phase)
     ds.requires(medium_phase_sampler)
     ds.requires(medium_transmittance)
-    ds.add_parameters(radiance = DeltatrackingNEEPathIntegrator(
+    ds.add_parameters(radiance = _maps.DeltatrackingNEEPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -368,16 +363,16 @@ def medium_radiance_path_integrator_NEE_DT(ds: DependencySet, *, ds_epsilon: flo
     ))
 
 
-def medium_radiance_path_integrator_NEE_DRTDS(ds: DependencySet, *, ds_epsilon: float = 0.1):
+def medium_radiance_path_integrator_NEE_DRTDS(ds: _internal.DependencySet, *, ds_epsilon: float = 0.1):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
@@ -385,7 +380,7 @@ def medium_radiance_path_integrator_NEE_DRTDS(ds: DependencySet, *, ds_epsilon: 
     ds.requires(medium_phase)
     ds.requires(medium_phase_sampler)
     ds.requires(medium_transmittance)
-    ds.add_parameters(radiance = DRTDSPathIntegrator(
+    ds.add_parameters(radiance = _maps.DRTDSPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -400,16 +395,16 @@ def medium_radiance_path_integrator_NEE_DRTDS(ds: DependencySet, *, ds_epsilon: 
     ))
 
 
-def medium_radiance_path_integrator_NEE_DRT(ds: DependencySet):
+def medium_radiance_path_integrator_NEE_DRT(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
@@ -417,7 +412,7 @@ def medium_radiance_path_integrator_NEE_DRT(ds: DependencySet):
     ds.requires(medium_phase)
     ds.requires(medium_phase_sampler)
     ds.requires(medium_transmittance)
-    ds.add_parameters(radiance = DRTPathIntegrator(
+    ds.add_parameters(radiance = _maps.DRTPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -431,16 +426,16 @@ def medium_radiance_path_integrator_NEE_DRT(ds: DependencySet):
     ))
 
 
-def medium_radiance_path_integrator_NEE_DRTQ(ds: DependencySet):
+def medium_radiance_path_integrator_NEE_DRTQ(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
@@ -448,7 +443,7 @@ def medium_radiance_path_integrator_NEE_DRTQ(ds: DependencySet):
     ds.requires(medium_phase)
     ds.requires(medium_phase_sampler)
     ds.requires(medium_transmittance)
-    ds.add_parameters(radiance = DRTQPathIntegrator(
+    ds.add_parameters(radiance = _maps.DRTQPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -463,16 +458,16 @@ def medium_radiance_path_integrator_NEE_DRTQ(ds: DependencySet):
 
 
 
-def medium_radiance_path_integrator_NEE_SPS(ds: DependencySet):
+def medium_radiance_path_integrator_NEE_SPS(ds: _internal.DependencySet):
     ds.requires(medium_sigma)
     try:
         ds.requires(medium_scattering_albedo)
     except:
-        ds.add_parameters(scattering_albedo=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(scattering_albedo=_maps.ZERO)
     try:
         ds.requires(medium_emission)
     except:
-        ds.add_parameters(emission=constant(6, 0.0, 0.0, 0.0))
+        ds.add_parameters(emission=_maps.ZERO)
     ds.requires(medium_boundary)
     ds.requires(medium_majorant)
     ds.requires(medium_environment)
@@ -480,7 +475,7 @@ def medium_radiance_path_integrator_NEE_SPS(ds: DependencySet):
     ds.requires(medium_phase)
     ds.requires(medium_phase_sampler)
     ds.requires(medium_transmittance)
-    ds.add_parameters(radiance = SPSPathIntegrator(
+    ds.add_parameters(radiance = _maps.SPSPathIntegrator(
         ds.sigma,
         ds.scattering_albedo,
         ds.emission,
@@ -494,8 +489,8 @@ def medium_radiance_path_integrator_NEE_SPS(ds: DependencySet):
     ))
 
 
-def medium_radiance(ds: DependencySet):
-    if ds.ensures('radiance', MapBase):
+def medium_radiance(ds: _internal.DependencySet):
+    if ds.ensures('radiance', _maps.MapBase):
         return
     try:
         ds.requires(medium_radiance_path_integrator_DT)
@@ -506,12 +501,12 @@ def medium_radiance(ds: DependencySet):
 
 #
 #
-# def medium_collision_integrator(ds: DependencySet, *,
+# def medium_collision_integrator(ds: _internal.DependencySet, *,
 #                                 sampling: Literal['uniform', 'transmittance', 'collision']):
 #
 #
 #
-# def medium_radiance(ds: DependencySet, *,
+# def medium_radiance(ds: _internal.DependencySet, *,
 #                     model: Literal['ao', 'ae', 'so', 'se', 'mo', 'me'],
 #                     ps: Literal['dt', 'drt', 'ssp'], **kwargs):
 #     ds.include(medium_environment, sampling=kwargs.get('environment_sampling', 'uniform'))
@@ -519,10 +514,10 @@ def medium_radiance(ds: DependencySet):
 
 
 
-def camera_sensors(ds: DependencySet, *, width: int, height: int, jittered: bool = False):
+def camera_sensors(ds: _internal.DependencySet, *, width: int, height: int, jittered: bool = False, fov: float = np.pi/4):
     ds.assert_ensures('camera_poses', torch.Tensor)
     camera_poses = ds.camera_poses
-    ds.add_parameters(camera=PerspectiveCameraSensor(width, height, camera_poses, jittered))
+    ds.add_parameters(camera=_maps.PerspectiveCameraSensor(width, height, camera_poses, fov=fov, jittered=jittered))
 
 #
 #
@@ -535,21 +530,21 @@ def camera_sensors(ds: DependencySet, *, width: int, height: int, jittered: bool
 #
 # im = camera.capture(ds.radiance)
 #
-# build_environment_maps(ds)
+# build_environment__maps(ds)
 #
 #
 # class Environment(DependentObject):
 #
-#     def __init__(self, parameter_set: DependencySet):
+#     def __init__(self, parameter_set: _internal.DependencySet):
 #         self._skybox = parameter_set.skybox
 #         self._skybox_sampler = parameter_set.skybox_sampler
 #
 #     @property
-#     def skybox(self) -> MapBase:
+#     def skybox(self) -> _maps.MapBase:
 #         return self._skybox
 #
 #     @property
-#     def skybox_sampler(self) -> MapBase:
+#     def skybox_sampler(self) -> _maps.MapBase:
 #         return self._skybox_sampler
 #
 #
@@ -570,23 +565,23 @@ def camera_sensors(ds: DependencySet, *, width: int, height: int, jittered: bool
 #         skybox_map = skybox_img2d.after(xr_projection())
 #         skybox_random_direction = XRQuadtreeRandomDirection(6, quadtree_densities, quadtree_levels)
 #         # skybox_random_direction = UniformRandomDirection(6)
-#         skybox_sampler = FunctionSampler(skybox_random_direction, skybox_map)
+#         skybox_sampler = _functionsampler(skybox_random_direction, skybox_map)
 #         super(XREnvironment, self).__init__(skybox_map, skybox_sampler)
 #
 #
 # class ExtinctionField(BoundObject):
 #     def __init__(self,
-#                  sigma: MapBase,
-#                  boundary: MapBase,
-#                  transmittance: MapBase,
-#                  collision_sampler: MapBase,
-#                  transmittance_sampler: MapBase
+#                  sigma: _maps.MapBase,
+#                  boundary: _maps.MapBase,
+#                  transmittance: _maps.MapBase,
+#                  collision_sampler: _maps.MapBase,
+#                  transmittance_sampler: _maps.MapBase
 #                  ):
 #
 #
 # class Medium(BoundObject):
 #     def __init__(self,
-#                  sigma: MapBase,
+#                  sigma: _maps.MapBase,
 #                  scattering_albedo: Optional[MapBase],
 #                  emission: Optional[MapBase],
 #                  boundary: Optional[MapBase]):

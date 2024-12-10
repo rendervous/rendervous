@@ -18,5 +18,6 @@ BACKWARD
     vec3 w = vec3(_input[3], _input[4], _input[5]);
     float dL_dT = _output_grad[0];
 
-    transmittance_DDA_bw(object, x, w, dL_dT);
+    if (sigma_grid_has_grad(object))
+        transmittance_DDA_bw(object, x, w, dL_dT);
 }

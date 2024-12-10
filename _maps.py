@@ -1,39 +1,35 @@
-from enum import IntEnum
-
-from .rendering import Layout, lazy_constant, tensor, object_buffer, ObjectBufferAccessor, pipeline_compute, \
-    compute_manager, submit, wrap_gpu, BufferUsage, MemoryLocation
-from ._internal import device, get_seeds, __INCLUDE_PATH__
-from ._functions import random_ids
-from rendervous.rendering._gmath import *
-from typing import List, Tuple, Optional, Literal, Union, Callable
+import vulky as vk
+from . import _internal
+# from ._internal import device, get_seeds, __INCLUDE_PATH__
+from . import _functions
+import typing
+# from typing import List, Tuple, Optional, Literal, Union, Callable
+import enum
 import torch
 import os
-from rendervous.rendering._gmath import vec2, vec3
+from vulky import vec2, vec3
 import numpy as np
+import math
 import threading
 
 
-__USE_VULKAN_DISPATCHER__ = True
-
-
-def torch_fallback(enable=True):
-    global __USE_VULKAN_DISPATCHER__
-    current_dipatcher = __USE_VULKAN_DISPATCHER__
-    __USE_VULKAN_DISPATCHER__ = not enable
-    class _using_torch_context():
-        def __enter__(self):
-            pass
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            global __USE_VULKAN_DISPATCHER__
-            __USE_VULKAN_DISPATCHER__ = current_dipatcher
-    return _using_torch_context()
-
-
-class BACKWARD_IMPLEMENTATIONS(IntEnum):
+class BACKWARD_IMPLEMENTATIONS(enum.IntEnum):
     NONE = 0
+    """
+    The map source code doesn't contains any backward function
+    """
     DEFAULT = 1
+    """
+    The map source code contains only the default backward function (input, output_grad, input_grad)
+    """
     WITH_OUTPUT = 2
+    """
+    The map source code contains only the output provided backward function (input, output, output_grad, input_grad)
+    """
     ALL = 3
+    """
+    The map source code contains both backward functions, with and without output.
+    """
 
 
 class DispatcherEngine:
@@ -76,16 +72,18 @@ class DispatcherEngine:
         return code
 
     @classmethod
-    def create_code_for_struct_declaration(cls, type_definition) -> Tuple[
+    def create_code_for_struct_declaration(cls, type_definition) -> typing.Tuple[
         str, dict, list]:  # Code, new structures, sizes
         if type_definition == MapBase:
             raise Exception('Basic structs can not contain map references')
         if type_definition == torch.Tensor:
             return 'GPUPtr', {}, []
-        if Layout.is_scalar_type(type_definition):
+        if vk.Layout.is_scalar_type(type_definition):
+            if type_definition == int:
+                return 'int', {}, []
+            if type_definition == 'float':
+                return 'float', {}, []
             return {
-                       int: 'int',
-                       float: 'float',
                        torch.int32: 'int',
                        torch.float32: 'float',
                        torch.int64: 'GPUPtr'
@@ -110,16 +108,18 @@ class DispatcherEngine:
         return type_definition.__name__, {}, []  # vec and mats
 
     @classmethod
-    def create_code_for_map_declaration(cls, type_definition, field_value, allow_block: bool = False) -> Tuple[
+    def create_code_for_map_declaration(cls, type_definition, field_value, allow_block: bool = False) -> typing.Tuple[
         str, dict, list]:  # Code, new structures, sizes
         if type_definition == MapBase:
             return cls.register_instance(field_value.obj)[1], {}, []
         if type_definition == torch.Tensor:
             return 'GPUPtr', {}, []
-        if Layout.is_scalar_type(type_definition):
+        if vk.Layout.is_scalar_type(type_definition):
+            if type_definition == int:
+                return 'int', {}, []
+            if type_definition == float:
+                return 'float', {}, []
             return {
-                       int: 'int',
-                       float: 'float',
                        torch.int32: 'int',
                        torch.float32: 'float',
                        torch.int64: 'GPUPtr'
@@ -127,7 +127,7 @@ class DispatcherEngine:
         if isinstance(type_definition, list):
             size = type_definition[0]
             t = type_definition[1]
-            field_value: ObjectBufferAccessor
+            field_value: vk.ObjectBufferAccessor
             element_decl, inner_structures, element_sizes = cls.create_code_for_map_declaration(t, field_value[0] if len(field_value) > 0 else None)
             return element_decl, inner_structures, [size] + element_sizes
         if isinstance(type_definition, dict):
@@ -281,7 +281,7 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
         return code
 
     @classmethod
-    def register_instance(cls, map: 'MapBase') -> Tuple[int, str]:  # new or existing instance id for the object
+    def register_instance(cls, map: 'MapBase') -> typing.Tuple[int, str]:  # new or existing instance id for the object
         signature = map.signature
         if signature not in cls.__MAP_INSTANCES__:
             instance_id = len(cls.__MAP_INSTANCES__) + 1
@@ -295,33 +295,33 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
         if cls.__ENGINE_OBJECTS__ is not None:
             return
 
-        map_fw_eval = object_buffer(element_description=Layout.create_structure('std430',
+        map_fw_eval = vk.object_buffer(layout=vk.Layout.from_structure(vk.LayoutAlignment.STD430,
                                                                                 main_map=torch.int64,
                                                                                 input=torch.int64,
                                                                                 output=torch.int64,
-                                                                                seeds=ivec4,
+                                                                                seeds=vk.ivec4,
                                                                                 start_index=int,
                                                                                 total_threads=int,
                                                                                 debug_ptr=torch.int64
                                                                                 ))
 
-        map_bw_eval = object_buffer(element_description=Layout.create_structure('std430',
+        map_bw_eval = vk.object_buffer(layout=vk.Layout.from_structure(vk.LayoutAlignment.STD430,
                                                                                 main_map=torch.int64,
                                                                                 input=torch.int64,
                                                                                 output_grad=torch.int64,
                                                                                 input_grad=torch.int64,
-                                                                                seeds=ivec4,
+                                                                                seeds=vk.ivec4,
                                                                                 start_index=int,
                                                                                 total_threads=int,
                                                                                 debug_ptr=torch.int64
                                                                                 ))
 
-        capture_fw_eval = object_buffer(element_description=Layout.create_structure('std430',
+        capture_fw_eval = vk.object_buffer(layout=vk.Layout.from_structure(vk.LayoutAlignment.STD430,
                                                                                     capture_sensor=torch.int64,
                                                                                     main_map=torch.int64,
                                                                                     sensors=torch.int64,
                                                                                     tensor=torch.int64,
-                                                                                    seeds=ivec4,
+                                                                                    seeds=vk.ivec4,
                                                                                     sensor_shape=[4, int],
                                                                                     start_index=int,
                                                                                     total_threads=int,
@@ -329,12 +329,12 @@ void backward (map_object, float _input[INPUT_DIM], float _output_grad[OUTPUT_DI
                                                                                     debug_ptr=torch.int64
                                                                                     ))
 
-        capture_bw_eval = object_buffer(element_description=Layout.create_structure('std430',
+        capture_bw_eval = vk.object_buffer(layout=vk.Layout.from_structure(vk.LayoutAlignment.STD430,
                                                                                     capture_sensor=torch.int64,
                                                                                     main_map=torch.int64,
                                                                                     sensors=torch.int64,
                                                                                     tensor_grad=torch.int64,
-                                                                                    seeds=ivec4,
+                                                                                    seeds=vk.ivec4,
                                                                                     sensor_shape=[4, int],
                                                                                     start_index=int,
                                                                                     total_threads=int,
@@ -409,14 +409,19 @@ void main()
 
         cls.ensure_engine_objects()
         # Build pipeline for forward map evaluation
-        pipeline = pipeline_compute()
-        pipeline.bind_uniform(0, cls.__ENGINE_OBJECTS__['map_fw_eval'])
-        pipeline.load_shader_from_source(full_code, include_dirs=[__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
+        pipeline = vk.pipeline_compute()
+        pipeline.layout(set=0, binding=0, settings=vk.DescriptorType.UNIFORM_BUFFER)
+        pipeline.load_shader_from_source(full_code, include_dirs=[_internal.__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
         pipeline.close()
 
-        cls.__FW_CS_ENGINE_PIPELINES__[map.signature] = pipeline
+        global_bindings = pipeline.create_descriptor_set_collection(set=0, count = 1)
+        global_bindings[0].update(
+            settings = cls.__ENGINE_OBJECTS__['map_fw_eval']
+        )
 
-        return pipeline
+        cls.__FW_CS_ENGINE_PIPELINES__[map.signature] = (pipeline, global_bindings)
+
+        return (pipeline, global_bindings)
 
     @classmethod
     def build_map_bw_eval_objects(cls, map: 'MapBase'):
@@ -486,14 +491,19 @@ void main()
 
         cls.ensure_engine_objects()
         # Build pipeline for forward map evaluation
-        pipeline = pipeline_compute()
-        pipeline.bind_uniform(0, cls.__ENGINE_OBJECTS__['map_bw_eval'])
-        pipeline.load_shader_from_source(full_code, include_dirs=[__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
+        pipeline = vk.pipeline_compute()
+        pipeline.layout(set=0, binding=0, settings=vk.DescriptorType.UNIFORM_BUFFER)
+        pipeline.load_shader_from_source(full_code, include_dirs=[_internal.__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
         pipeline.close()
 
-        cls.__BW_CS_ENGINE_PIPELINES__[map.signature] = pipeline
+        global_bindings = pipeline.create_descriptor_set_collection(set=0, count=1)
+        global_bindings[0].update(
+            settings=cls.__ENGINE_OBJECTS__['map_bw_eval']
+        )
 
-        return pipeline
+        cls.__BW_CS_ENGINE_PIPELINES__[map.signature] = (pipeline, global_bindings)
+
+        return (pipeline, global_bindings)
 
     @classmethod
     def build_capture_fw_eval_objects(cls, capture_object: 'SensorsBase', field: 'MapBase'):
@@ -608,14 +618,19 @@ void main()
 
         cls.ensure_engine_objects()
         # Build pipeline for forward map evaluation
-        pipeline = pipeline_compute()
-        pipeline.bind_uniform(0, cls.__ENGINE_OBJECTS__['capture_fw_eval'])
-        pipeline.load_shader_from_source(full_code, include_dirs=[__INCLUDE_PATH__]+cls.__INCLUDE_DIRS__)
+        pipeline = vk.pipeline_compute()
+        pipeline.layout(set=0, binding=0, settings=vk.DescriptorType.UNIFORM_BUFFER)
+        pipeline.load_shader_from_source(full_code, include_dirs=[_internal.__INCLUDE_PATH__]+cls.__INCLUDE_DIRS__)
         pipeline.close()
 
-        cls.__FW_CS_ENGINE_PIPELINES__[capture_signature] = pipeline
+        global_bindings = pipeline.create_descriptor_set_collection(set=0, count=1)
+        global_bindings[0].update(
+            settings = cls.__ENGINE_OBJECTS__['capture_fw_eval']
+        )
 
-        return pipeline
+        cls.__FW_CS_ENGINE_PIPELINES__[capture_signature] = (pipeline, global_bindings)
+
+        return (pipeline, global_bindings)
 
     @classmethod
     def build_capture_bw_eval_objects(cls, capture_object: 'SensorsBase', field: 'MapBase'):
@@ -716,90 +731,98 @@ void main()
 
         cls.ensure_engine_objects()
         # Build pipeline for forward map evaluation
-        pipeline = pipeline_compute()
-        pipeline.bind_uniform(0, cls.__ENGINE_OBJECTS__['capture_bw_eval'])
-        pipeline.load_shader_from_source(full_code, include_dirs=[__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
+        pipeline = vk.pipeline_compute()
+        pipeline.layout(set=0, binding=0, settings=vk.DescriptorType.UNIFORM_BUFFER)
+        pipeline.load_shader_from_source(full_code, include_dirs=[_internal.__INCLUDE_PATH__] + cls.__INCLUDE_DIRS__)
         pipeline.close()
 
-        cls.__BW_CS_ENGINE_PIPELINES__[capture_signature] = pipeline
+        global_bindings = pipeline.create_descriptor_set_collection(set=0, count=1)
+        global_bindings[0].update(
+            settings=cls.__ENGINE_OBJECTS__['capture_bw_eval']
+        )
 
-        return pipeline
+        cls.__BW_CS_ENGINE_PIPELINES__[capture_signature] = (pipeline, global_bindings)
+
+        return (pipeline, global_bindings)
 
     @classmethod
     def eval_capture_forward(cls, capture_object: 'SensorsBase', field: 'MapBase',
-                             sensors: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
-                             fw_samples: int = 1, debug_out: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if sensors is not None:
-            total_threads = sensors.numel() // sensors.shape[-1]
-        else:
-            total_threads = math.prod(capture_object.index_shape[
-                                      :capture_object.input_dim]).item()  # capture_object.screen_width * capture_object.screen_height
+                             sensors: typing.Optional[torch.Tensor] = None, batch_size: typing.Optional[int] = None,
+                             fw_samples: int = 1, debug_out: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        with cls.__LOCKER__:
 
-        assert debug_out is None or debug_out.numel() == total_threads, f"Debug tensor provided has not the required size {total_threads}"
+            if sensors is not None:
+                total_threads = sensors.numel() // sensors.shape[-1]
+            else:
+                total_threads = math.prod(capture_object.index_shape[
+                                          :capture_object.input_dim]).item()  # capture_object.screen_width * capture_object.screen_height
 
-        if batch_size is None:
-            batch_size = total_threads
+            assert debug_out is None or debug_out.numel() == total_threads, f"Debug tensor provided has not the required size {total_threads}"
 
-        cache_key = (batch_size, capture_object.signature, field.signature)
+            if batch_size is None:
+                batch_size = total_threads
 
-        # create man if not cached
-        if cache_key not in cls.__FW_CAPTURE_CACHED_MAN__:
-            pipeline = cls.build_capture_fw_eval_objects(capture_object, field)
-            man = compute_manager()
-            man.set_pipeline(pipeline)
-            man.dispatch_threads_1D(batch_size, group_size_x=32)
-            man.freeze()
-            cls.__FW_CAPTURE_CACHED_MAN__[cache_key] = man
+            cache_key = (batch_size, capture_object.signature, field.signature)
 
-        man = cls.__FW_CAPTURE_CACHED_MAN__[cache_key]
+            # create man if not cached
+            if cache_key not in cls.__FW_CAPTURE_CACHED_MAN__:
+                pipeline, global_bindings = cls.build_capture_fw_eval_objects(capture_object, field)
+                man = vk.compute_manager()
+                man.set_pipeline(pipeline)
+                man.bind(global_bindings[0])
+                man.dispatch_threads_1D(batch_size, group_size_x=32)
+                man.freeze()
+                cls.__FW_CAPTURE_CACHED_MAN__[cache_key] = man
 
-        # assert input.shape[-1] == map_object.input_dim, f'Wrong last dimension for the input tensor, must be {map_object.input_dim}'
+            man = cls.__FW_CAPTURE_CACHED_MAN__[cache_key]
 
-        if sensors is not None:
-            output = tensor(*sensors.shape[:-1], field.output_dim, dtype=torch.float)
-        else:
-            output = tensor(*capture_object.index_shape[:capture_object.input_dim], field.output_dim, dtype=torch.float)
+            # assert input.shape[-1] == map_object.input_dim, f'Wrong last dimension for the input tensor, must be {map_object.input_dim}'
 
-        capture_object._pre_eval(False)
-        field._pre_eval(False)
+            if sensors is not None:
+                output = vk.tensor(*sensors.shape[:-1], field.output_dim, dtype=torch.float)
+            else:
+                output = vk.tensor(*capture_object.index_shape[:capture_object.input_dim], field.output_dim, dtype=torch.float)
 
-        output_ptr = wrap_gpu(output, 'out')
+            capture_object._pre_eval(False)
+            field._pre_eval(False)
 
-        with cls.__ENGINE_OBJECTS__['capture_fw_eval'] as b:
-            b.capture_sensor = wrap_gpu(capture_object)
-            b.main_map = wrap_gpu(field)
-            b.sensors = wrap_gpu(sensors)
-            b.tensor = output_ptr
-            b.seeds[:] = get_seeds()
-            shape = b.sensor_shape
-            shape[0] = capture_object.index_shape[0].item()
-            shape[1] = capture_object.index_shape[1].item()
-            shape[2] = capture_object.index_shape[2].item()
-            shape[3] = capture_object.index_shape[3].item()
-            b.start_index = 0
-            b.total_threads = total_threads
-            b.samples = fw_samples
-            b.debug_ptr = 0 if debug_out is None else wrap_gpu(debug_out, 'out')
+            output_ptr = vk.wrap_gpu(output, 'out')
 
-        for batch in range((total_threads + batch_size - 1) // batch_size):
             with cls.__ENGINE_OBJECTS__['capture_fw_eval'] as b:
-                b.start_index = batch * batch_size
-            submit(man)
+                b.capture_sensor = vk.wrap_gpu(capture_object)
+                b.main_map = vk.wrap_gpu(field)
+                b.sensors = vk.wrap_gpu(sensors)
+                b.tensor = output_ptr
+                b.seeds[:] = _internal.get_seeds()
+                shape = b.sensor_shape
+                shape[0] = capture_object.index_shape[0].item()
+                shape[1] = capture_object.index_shape[1].item()
+                shape[2] = capture_object.index_shape[2].item()
+                shape[3] = capture_object.index_shape[3].item()
+                b.start_index = 0
+                b.total_threads = total_threads
+                b.samples = fw_samples
+                b.debug_ptr = 0 if debug_out is None else vk.wrap_gpu(debug_out, 'out')
 
-        output_ptr.mark_as_dirty()
-        output_ptr.invalidate()
+            for batch in range((total_threads + batch_size - 1) // batch_size):
+                with cls.__ENGINE_OBJECTS__['capture_fw_eval'] as b:
+                    b.start_index = batch * batch_size
+                vk.submit(man)
 
-        capture_object._pos_eval(False)
-        field._pos_eval(False)
+            output_ptr.mark_as_dirty()
+            output_ptr.invalidate()
 
-        # if sensors is None:
-        #     output = output.view(*capture_object.index_shape[:capture_object.input_dim],-1)
+            capture_object._pos_eval(False)
+            field._pos_eval(False)
 
-        return output
+            # if sensors is None:
+            #     output = output.view(*capture_object.index_shape[:capture_object.input_dim],-1)
+
+            return output.clone()
 
     @classmethod
     def eval_capture_backward(cls, capture_object: 'SensorsBase', field: 'MapBase', output_grad: torch.Tensor,
-                              sensors: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
+                              sensors: typing.Optional[torch.Tensor] = None, batch_size: typing.Optional[int] = None,
                               bw_samples: int = 1, debug_out: torch.Tensor = None):
         with cls.__LOCKER__:
             if sensors is not None:
@@ -817,9 +840,10 @@ void main()
 
             # create man if not cached
             if cache_key not in cls.__BW_CAPTURE_CACHED_MAN__:
-                pipeline = cls.build_capture_bw_eval_objects(capture_object, field)
-                man = compute_manager()
+                pipeline, global_bindings = cls.build_capture_bw_eval_objects(capture_object, field)
+                man = vk.compute_manager()
                 man.set_pipeline(pipeline)
+                man.bind(global_bindings[0])
                 man.dispatch_threads_1D(batch_size, group_size_x=32)
                 man.freeze()
                 cls.__BW_CAPTURE_CACHED_MAN__[cache_key] = man
@@ -830,13 +854,14 @@ void main()
 
             capture_object._pre_eval(True)
             field._pre_eval(True)
+            torch.cuda.synchronize()
 
             with cls.__ENGINE_OBJECTS__['capture_bw_eval'] as b:
-                b.capture_sensor = wrap_gpu(capture_object)
-                b.main_map = wrap_gpu(field)
-                b.sensors = wrap_gpu(sensors)
-                b.tensor_grad = wrap_gpu(output_grad)
-                b.seeds[:] = get_seeds()
+                b.capture_sensor = vk.wrap_gpu(capture_object)
+                b.main_map = vk.wrap_gpu(field)
+                b.sensors = vk.wrap_gpu(sensors)
+                b.tensor_grad = vk.wrap_gpu(output_grad)
+                b.seeds[:] = _internal.get_seeds()
                 shape = b.sensor_shape
                 shape[0] = capture_object.index_shape[0].item()
                 shape[1] = capture_object.index_shape[1].item()
@@ -845,15 +870,16 @@ void main()
                 b.start_index = 0
                 b.total_threads = total_threads
                 b.samples = bw_samples
-                b.debug_ptr = 0 if debug_out is None else wrap_gpu(debug_out, 'out')
+                b.debug_ptr = 0 if debug_out is None else vk.wrap_gpu(debug_out, 'out')
 
             for batch in range((total_threads + batch_size - 1) // batch_size):
                 with cls.__ENGINE_OBJECTS__['capture_bw_eval'] as b:
                     b.start_index = batch * batch_size
-                submit(man)
+                vk.submit(man)
 
             capture_object._pos_eval(True)
             field._pos_eval(True)
+            torch.cuda.synchronize()
 
     @classmethod
     def eval_map_forward(cls, map_object: 'MapBase', input: torch.Tensor) -> torch.Tensor:
@@ -863,9 +889,10 @@ void main()
 
         # create man if not cached
         if cache_key not in cls.__FW_DISPATCHER_CACHED_MAN__:
-            pipeline = cls.build_map_fw_eval_objects(map_object)
-            man = compute_manager()
+            pipeline, global_bindings = cls.build_map_fw_eval_objects(map_object)
+            man = vk.compute_manager()
             man.set_pipeline(pipeline)
+            man.bind(global_bindings[0])
             man.dispatch_threads_1D(total_threads, group_size_x=32)
             man.freeze()
             cls.__FW_DISPATCHER_CACHED_MAN__[cache_key] = man
@@ -874,21 +901,21 @@ void main()
 
         assert input.shape[
                    -1] == map_object.input_dim, f'Wrong last dimension for the input tensor, must be {map_object.input_dim}'
-        output = tensor(*input.shape[:-1], map_object.output_dim, dtype=torch.float)
+        output = vk.tensor(*input.shape[:-1], map_object.output_dim, dtype=torch.float)
 
         map_object._pre_eval(False)
 
-        output_ptr = wrap_gpu(output, 'out')
+        output_ptr = vk.wrap_gpu(output, 'out')
 
         with cls.__ENGINE_OBJECTS__['map_fw_eval'] as b:
-            b.main_map = wrap_gpu(map_object)
-            b.input = wrap_gpu(input)
+            b.main_map = vk.wrap_gpu(map_object)
+            b.input = vk.wrap_gpu(input)
             b.output = output_ptr
-            b.seeds[:] = get_seeds()
+            b.seeds[:] = _internal.get_seeds()
             b.start_index = 0
             b.total_threads = total_threads
 
-        submit(man)
+        vk.submit(man)
 
         map_object._pos_eval(False)
 
@@ -906,9 +933,10 @@ void main()
 
             # create man if not cached
             if cache_key not in cls.__BW_DISPATCHER_CACHED_MAN__:
-                pipeline = cls.build_map_bw_eval_objects(map_object)
-                man = compute_manager()
+                pipeline, global_bindings = cls.build_map_bw_eval_objects(map_object)
+                man = vk.compute_manager()
                 man.set_pipeline(pipeline)
+                man.bind(global_bindings[0])
                 man.dispatch_threads_1D(total_threads, group_size_x=32)
                 man.freeze()
                 cls.__BW_DISPATCHER_CACHED_MAN__[cache_key] = man
@@ -927,18 +955,18 @@ void main()
 
             map_object._pre_eval(True)
 
-            input_grad_ptr = wrap_gpu(input_grad, 'inout')
+            input_grad_ptr = vk.wrap_gpu(input_grad, 'inout')
 
             with cls.__ENGINE_OBJECTS__['map_bw_eval'] as b:
-                b.main_map = wrap_gpu(map_object)
-                b.input = wrap_gpu(input)
-                b.output_grad = wrap_gpu(output_grad)
+                b.main_map = vk.wrap_gpu(map_object)
+                b.input = vk.wrap_gpu(input)
+                b.output_grad = vk.wrap_gpu(output_grad)
                 b.input_grad = input_grad_ptr
-                b.seeds[:] = get_seeds()
+                b.seeds[:] = _internal.get_seeds()
                 b.start_index = 0
                 b.total_threads = total_threads
 
-            submit(man)
+            vk.submit(man)
 
             map_object._pos_eval(True)
 
@@ -1001,34 +1029,37 @@ RaycastableInfo = map_struct(
 )
 
 
-def parameter(p: Union[None, torch.Tensor, torch.nn.Parameter]):
+def parameter(p: typing.Union[None, torch.Tensor, torch.nn.Parameter]):
     if p is None:
         return None
     if isinstance(p, torch.nn.Parameter):
         return p
-    return torch.nn.Parameter(p, requires_grad=p.requires_grad)
+    assert not p.requires_grad, 'Tensors used as parameters can no require grads. Use Parameter instead.'
+    return torch.nn.Parameter(p, requires_grad=False)
 
 
-def bind_parameter(field: ObjectBufferAccessor, t: torch.Tensor):
-    field.data = wrap_gpu(t, 'in')
+def bind_parameter(field: vk.ObjectBufferAccessor, t: torch.Tensor):
+    field.data = vk.wrap_gpu(t, 'in')
     if t is not None:
         for i, s in enumerate(t.shape):
             field.stride[i] = t.stride(i)
             field.shape[i] = s
 
 
-def bind_parameter_grad(field: ObjectBufferAccessor):
+def bind_parameter_grad(field: vk.ObjectBufferAccessor):
     if field.data.obj is None:
+        field.grad_data = vk.wrap_gpu(None, 'inout')
         return
     t: torch.Tensor = field.data.obj
     if t.requires_grad:
         if t.grad is None:
-            t.grad = tensor(*t.shape, dtype=t.dtype).zero_()
-        field.grad_data = wrap_gpu(t.grad, 'inout')
+            t.grad = vk.tensor(*t.shape, dtype=t.dtype).zero_()
+            # t.grad = torch.zeros_like(t)
+        field.grad_data = vk.wrap_gpu(t.grad, 'inout')
 
 
 class TensorCheck(object):
-    def __init__(self, initial_value: Optional[torch.Tensor] = None):
+    def __init__(self, initial_value: typing.Optional[torch.Tensor] = None):
         self.cached_tensor = initial_value
         self.cached_tensor_version = -1 if initial_value is None else initial_value._version
 
@@ -1077,7 +1108,7 @@ class MapMeta(type):
                 return p
 
             parameters = {'rdv_map_id': int, 'rdv_map_pad0': int, **parameters}
-            parameters_layout = lambda s: Layout.create(from_type_2_layout_description(parameters, s), mode='scalar')
+            parameters_layout = lambda s: vk.Layout.from_description(vk.LayoutAlignment.SCALAR, description=from_type_2_layout_description(parameters, s))
             ext_class.default_generics = extension_generics
             ext_class.dynamic_requires = extension_dynamic_requires
             ext_class.map_object_layout = parameters_layout
@@ -1090,44 +1121,49 @@ class MapMeta(type):
 
     def __call__(self, *args, **kwargs):
         map_instance: MapBase = super(MapMeta, self).__call__(*args, **kwargs)
-        generic_for_dynamic_id = {}
-        if len(self.dynamic_requires) != 0:  # if dynamic module is used
-            MapMeta.__DYNAMIC_ID__  += 1
-            generic_for_dynamic_id = {'RDV_DYNAMIC_ID': MapMeta.__DYNAMIC_ID__ }
-        map_instance.generics.update(generic_for_dynamic_id)
-        map_instance._create_signature()
-        map_id, map_codename = DispatcherEngine.register_instance(map_instance)
-        map_instance.rdv_map_id = map_id
+        if not map_instance.is_generic_input and not map_instance.is_generic_output:
+            assert not map_instance.has_generic_submap(), f'A non-generic map {type(map_instance)} can not contains generic submaps'
+        if not map_instance.is_generic:
+            generic_for_dynamic_id = {}
+            if len(self.dynamic_requires) != 0:  # if dynamic module is used
+                MapMeta.__DYNAMIC_ID__  += 1
+                generic_for_dynamic_id = {'RDV_DYNAMIC_ID': MapMeta.__DYNAMIC_ID__ }
+            map_instance.generics.update(generic_for_dynamic_id)
+            map_instance._create_signature()
+            map_id, map_codename = DispatcherEngine.register_instance(map_instance)
+            map_instance.rdv_map_id = map_id
         return map_instance
 
 
 class GPUDirectModule(torch.nn.Module):
-    def __init__(self, accessor: ObjectBufferAccessor):
-        assert accessor._rdv_layout.is_structure
+    def __init__(self, accessor: typing.Optional[vk.ObjectBufferAccessor]):
+        assert accessor is None or accessor._rdv_layout.is_structure
         super().__init__()
-        # object used to access attributes from the Module directly to the gpu
         object.__setattr__(self, '_rdv_accessor', accessor)
-        for k, (offset, field_type) in accessor._rdv_layout.fields_layout.items():
-            if field_type.is_array:  # lists
-                object.__setattr__(self, k, getattr(accessor, k))
-            if field_type.is_structure:
-                # Wrap field structures with a struct module
-                super().__setattr__(k, StructModule(getattr(accessor, k)))
+        if accessor is not None:
+            # object used to access attributes from the Module directly to the gpu
+            for k, (offset, field_type) in accessor._rdv_layout.fields_layout.items():
+                if field_type.is_array:  # lists
+                    object.__setattr__(self, k, getattr(accessor, k))
+                if field_type.is_structure and field_type.declaration['__name__'] != ParameterDescriptor['__name__']:
+                    # Wrap field structures with a struct module
+                    super().__setattr__(k, StructModule(getattr(accessor, k)))
 
     def __setattr__(self, key, value):
-        a: ObjectBufferAccessor = self._rdv_accessor
-        # Update gpu info if field is part of the accessed object
-        if key in a._rdv_fields:
-            field_layout = a._rdv_layout.fields_layout[key][1]
-            if field_layout.scalar_format == 'Q':
-                if isinstance(value, int):
-                    setattr(a, key, value)
+        a: vk.ObjectBufferAccessor = self._rdv_accessor
+        if a is not None:
+            # Update gpu info if field is part of the accessed object
+            if key in a._rdv_fields:
+                field_layout = a._rdv_layout.fields_layout[key][1]
+                if field_layout.scalar_format == 'Q':
+                    if isinstance(value, int):
+                        setattr(a, key, value)
+                    else:
+                        setattr(a, key, vk.wrap_gpu(value))
+                elif field_layout.is_structure and field_layout.declaration['__name__'] == ParameterDescriptor['__name__']: # key in self._parameters or isinstance(value, torch.nn.Parameter):
+                    bind_parameter(getattr(a, key), value)
                 else:
-                    setattr(a, key, wrap_gpu(value))
-            elif field_layout.is_structure and field_layout.declaration['__name__'] == ParameterDescriptor['__name__']: # key in self._parameters or isinstance(value, torch.nn.Parameter):
-                bind_parameter(getattr(a, key), value)
-            else:
-                setattr(a, key, value)
+                    setattr(a, key, value)
         super().__setattr__(key, value)
 
     def _pre_eval(self, include_grads: bool = False):
@@ -1136,7 +1172,7 @@ class GPUDirectModule(torch.nn.Module):
                 if v.requires_grad:
                     # print(f'Bound parameter with grad for {k} in {type(self)}')
                     bind_parameter_grad(getattr(self._rdv_accessor, k))
-        def deep_pre_eval(m: Union[torch.nn.Module]):
+        def deep_pre_eval(m: typing.Union[torch.nn.Module]):
             if isinstance(m, GPUDirectModule):
                 m._pre_eval(include_grads)
             if isinstance(m, torch.nn.ModuleList):
@@ -1150,45 +1186,114 @@ class GPUDirectModule(torch.nn.Module):
                 r.flush()
 
     def _pos_eval(self, include_grads: bool = False):
-        def deep_pos_eval(m: Union[torch.nn.Module]):
-            if isinstance(m, GPUDirectModule):
-                m._pos_eval(include_grads)
+        def deep_pos_eval(m: typing.Union[torch.nn.Module]):
+            # if isinstance(m, GPUDirectModule):
+            #     m._pos_eval(include_grads)
             if isinstance(m, torch.nn.ModuleList):
                 for c in m:
                     deep_pos_eval(c)
-        for k, m in self._modules.items():
-            deep_pos_eval(m)
-        # iterate over all potential wrapped objects that needs to update their info from the gpu
-        for r in self._rdv_accessor.references():
-            if r is not None:
-                r.mark_as_dirty()
-                r.invalidate()
+            for k, mo in m._modules.items():
+                deep_pos_eval(mo)
+            # iterate over all potential wrapped objects that needs to update their info from the gpu
+            if isinstance(m, GPUDirectModule):
+                for r in self._rdv_accessor.references():
+                    if r is not None:
+                        if isinstance(r.obj, torch.Tensor):
+                            assert torch.isnan(r.obj).sum() == 0, f'Object {type(r.obj)} with nans, shape: {r.obj.shape}'
+                        r.mark_as_dirty()
+                        r.invalidate()
+                        if isinstance(r.obj, torch.Tensor):
+                            assert torch.isnan(r.obj).sum() == 0, f'Object {type(r.obj)} with nans, shape: {r.obj.shape}'
+
+        deep_pos_eval(self)
 
 
 class MapBase(GPUDirectModule, metaclass=MapMeta):
     __extension_info__ = None  # none extension info marks the node as abstract
     __bindable__ = None
-    map_object_layout: Callable[[int], Layout] = None
+    map_object_layout: typing.Callable[[int], vk.Layout] = None
 
     def __init__(self, *args, **generics):
         array_size = 0 if len(args) == 0 else args[0]
+        generics = {**self.default_generics, **generics}
+        is_generic = 'INPUT_DIM' not in generics or 'OUTPUT_DIM' not in generics
+        # if not is_generic:
         instance_layout = type(self).map_object_layout(array_size)
-        map_buffer = object_buffer(element_description=instance_layout, usage=BufferUsage.STORAGE,
-                                   memory=MemoryLocation.CPU)
+        map_buffer = vk.object_buffer(layout=instance_layout, usage=vk.BufferUsage.STORAGE,
+                                   memory=vk.MemoryLocation.CPU)
         object.__setattr__(self, '__bindable__', map_buffer)
         object.__setattr__(self, '_rdv_map_buffer', map_buffer)
         object.__setattr__(self, '_rdv_trigger_bw', torch.tensor([0.0], requires_grad=True))
         object.__setattr__(self, '_rdv_no_trigger_bw', torch.tensor([0.0], requires_grad=False))
-        object.__setattr__(self, 'generics', {**self.default_generics, **generics})
+        object.__setattr__(self, 'generics', generics)
         super().__init__(map_buffer.accessor)
 
-    @lazy_constant
-    def input_dim(self):
-        return self.generics['INPUT_DIM']
+    def has_generic_submap(self):
+        def deep_search(module: torch.nn.Module):
+            for k, m in module._modules.items():
+                if isinstance(m, MapBase):
+                    if m.is_generic:
+                        return True
+                    continue
+                if m is None:
+                    return False
+                return deep_search(m)
+            return False
+        return deep_search(self)
 
-    @lazy_constant
-    def output_dim(self):
-        return self.generics['OUTPUT_DIM']
+    @vk.lazy_constant
+    def is_generic(self):
+        return self.input_dim is None or self.output_dim is None or self.has_generic_submap()
+
+    @vk.lazy_constant
+    def is_generic_input(self):
+        return self.input_dim is None
+
+    @vk.lazy_constant
+    def is_generic_output(self):
+        return self.output_dim is None
+
+    @staticmethod
+    def match_input(*maps: 'MapBase') -> typing.Tuple['MapBase', ...]:
+        input_dim = None
+        for m in maps:
+            input_dim = input_dim or m.input_dim
+        if input_dim is None:
+            return maps
+        return tuple(m.cast(input_dim=input_dim) for m in maps)
+
+    @staticmethod
+    def match_output(*maps: 'MapBase'):
+        output_dim = None
+        for m in maps:
+            output_dim = output_dim or (m.output_dim if m.output_dim != 1 else None)
+        if output_dim is None or output_dim == 1:
+            return maps
+        return tuple(m.cast(output_dim=output_dim) for m in maps)
+
+    @vk.lazy_constant
+    def is_scalar_output(self):
+        return self.output_dim is not None and self.output_dim == 1
+
+    def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+        """
+        This method sould be overriden in all maps that support generics to create
+        a generic instance. Always check if the map type satisfies input and output dimensions.
+        """
+        assert not self.is_generic, f"Missing cast at {type(self)}: all generic maps must implement properly a cast method"
+        assert input_dim is None or self.input_dim == input_dim, f"Required input {input_dim} was not satisfied {self.input_dim}"
+        assert output_dim is None or self.output_dim == output_dim or self.output_dim == 1, f"Required output {output_dim} was not satisfied {self.output_dim}"
+        if self.is_scalar_output and output_dim is not None and output_dim > 1:
+            return self.promote(output_dim)  # Automatic map promotion
+        return self
+
+    @vk.lazy_constant
+    def input_dim(self) -> typing.Optional[int]:
+        return self.generics.get('INPUT_DIM', None)
+
+    @vk.lazy_constant
+    def output_dim(self) -> typing.Optional[int]:
+        return self.generics.get('OUTPUT_DIM', None)
 
     def get_maximum(self) -> torch.Tensor:
         raise NotImplementedError()
@@ -1224,33 +1329,53 @@ class MapBase(GPUDirectModule, metaclass=MapMeta):
         super()._pre_eval(include_grads)
         self._rdv_map_buffer.update_gpu()
 
-    def forward_torch(self, *args):
-        raise Exception(f"Not implemented torch engine in type {type(self)}")
+    # def forward_torch(self, *args):
+    #     raise Exception(f"Not implemented torch engine in type {type(self)}")
 
     def forward(self, *args):
-        # Use generic evaluator
-        if not __USE_VULKAN_DISPATCHER__:
-            return self.forward_torch(*args)
+        input_tensor, = args
+        assert not self.is_generic_output, "Can not eval a map with generic output. Use cast specifying desired output dimension"
+        assert self.is_generic_input or self.input_dim == input_tensor.shape[-1], "Map input dimension and tensor last dim missmatch"
+        if self.is_generic_input:
+            map_object = self.cast(input_dim=input_tensor.shape[-1])
         else:
-            trigger_bw = self._rdv_trigger_bw if any(True for _ in self.parameters()) else self._rdv_no_trigger_bw
-            return AutogradMapFunction.apply(*args, trigger_bw, self)
+            map_object = self
+        assert not map_object.is_generic, f'Evaluated map is still generic input:{map_object.is_generic_input} output:{map_object.is_generic_output} children: {map_object.has_generic_submap()}'
+        trigger_bw = map_object._rdv_trigger_bw if any(True for _ in map_object.parameters()) else map_object._rdv_no_trigger_bw
+        return AutogradMapFunction.apply(input_tensor, trigger_bw, map_object)
 
     def after(self, prev_map: 'MapBase') -> 'MapBase':
-        return Composition(prev_map, self)
+        return CompositionMap(prev_map, self)
 
     def then(self, next_map: 'MapBase') -> 'MapBase':
-        return Composition(self, next_map)
+        if isinstance(next_map, Identity):
+            return self
+        if isinstance(next_map, InputPromoteMap):
+            return ComposePromoteMap(self, dim=next_map.output_dim)
+        return CompositionMap(self, next_map)
 
-    def promote(self, output_dim: int) -> 'MapBase':
-        return PromoteMap(self, output_dim)
+    def promote(self, output_dim: typing.Optional[int] = None) -> 'MapBase':
+        return ComposePromoteMap(self, output_dim)
+
+    @staticmethod
+    def as_map(data: typing.Union[int, float, torch.Tensor, 'MapBase']):
+        if isinstance(data, MapBase):
+            return data
+        if isinstance(data, int) or isinstance(data, float):
+            t = vk.tensor(1, dtype=torch.float32)
+            t[:] = data
+            return ConstantMap(t)
+        if isinstance(data, torch.Tensor):
+            return ConstantMap(data)
+        raise Exception(f"Can not convert type {type(data)} into a map")
 
     def like_this(self, o):
         if isinstance(o, int) or isinstance(o, float):
-            t = tensor(self.output_dim, dtype=torch.float32)
+            t = vk.tensor(self.output_dim, dtype=torch.float32)
             t[:] = o
-            return ConstantMap(self.input_dim, t)
+            return ConstantMap(t, input_dim=self.input_dim)
         if isinstance(o, torch.Tensor):
-            o = ConstantMap(self.input_dim, o)
+            o = ConstantMap(o, input_dim=self.input_dim)
         if isinstance(o, MapBase):
             if o.output_dim == self.output_dim:
                 return o
@@ -1271,45 +1396,123 @@ class MapBase(GPUDirectModule, metaclass=MapMeta):
         return CustomGradMap(self, map)
 
     def __add__(self, other):
-        return AdditionMap(*MapBase.make_match(self, other))
+        return AdditionMap(self, MapBase.as_map(other))
 
     def __radd__(self, other):
-        return AdditionMap(*MapBase.make_match(self, other))
+        return AdditionMap(self, MapBase.as_map(other))
 
     def __sub__(self, other):
-        return SubtractionMap(*MapBase.make_match(self, other))
+        return SubtractionMap(self, MapBase.as_map(other))
 
     def __rsub__(self, other):
-        return SubtractionMap(*MapBase.make_match(other, self))
+        return SubtractionMap(self, MapBase.as_map(other))
 
     def __mul__(self, other):
-        return MultiplicationMap(*MapBase.make_match(self, other))
+        return MultiplicationMap(self, MapBase.as_map(other))
 
     def __rmul__(self, other):
-        return MultiplicationMap(*MapBase.make_match(self, other))
+        return MultiplicationMap(self, MapBase.as_map(other))
 
     def __truediv__(self, other):
-        return DivisionMap(*MapBase.make_match(self, other))
+        return DivisionMap(self, MapBase.as_map(other))
 
     def __rtruediv__(self, other):
-        return DivisionMap(*MapBase.make_match(other, self))
+        return DivisionMap(self, MapBase.as_map(other))
 
     def __getitem__(self, item):
         if isinstance(item, int):
-            return IndexMap(self, [item])
+            return ComposeSelectMap(self, [item])
         if isinstance(item, tuple) or isinstance(item, list):
-            return IndexMap(self, list(item))
+            return ComposeSelectMap(self, list(item))
         if isinstance(item, slice):
-            indices = [i for i in range(self.output_dim)]
-            return IndexMap(self, indices[item])
+            if self.output_dim is None:
+                indices = list(range(10000)) # sufficently large to index
+            else:
+                indices = [i for i in range(self.output_dim)]
+            return ComposeSelectMap(self, indices[item])
         raise Exception(f"Not supported index/slice object {type(item)}")
 
     def __or__(self, other):
-        return ConcatMap(self, other)
+        return ConcatMap(self, MapBase.as_map(other))
+
+    def __matmul__(self, other):
+        return self.then(MatrixMultMap(other))
+
+    def __rmatmul__(self, other):
+        return self.then(MatrixMultMap(other, premul=True))
+
+
+# class ParameterizedAutograd(torch.autograd.Function):
+#     @staticmethod
+#     def forward(ctx: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+#         process, *p = args
+#         input_p = [torch.nn.Parameter(t, requires_grad=t.requires_grad) for t in p]
+#         with torch.enable_grad():
+#             outputs = process(*input_p)
+#             if isinstance(outputs, torch.Tensor):
+#                 outputs = [outputs]
+#             os = [o.clone() for o in outputs]
+#         ctx.input_count = len(p)
+#         ctx.save_for_backward(*p, *input_p, *os)
+#         if not isinstance(outputs, torch.Tensor) and len(outputs) == 1:
+#             return outputs[0]
+#         return outputs
+#
+#     @staticmethod
+#     def backward(ctx: typing.Any, *grad_outputs: typing.Any) -> typing.Any:
+#         input_count = ctx.input_count
+#         p = ctx.saved_tensors[:input_count]
+#         input_p = ctx.saved_tensors[input_count:input_count*2]
+#         outputs = ctx.saved_tensors[input_count*2:]
+#         with torch.enable_grad():
+#             # grads = torch.autograd.grad(outputs, input_p, grad_outputs, allow_unused=True)
+#             torch.autograd.backward(outputs, grad_outputs)
+#         return None, *tuple(None if t.grad is None else t.grad.clone() for t in input_p)
+
+
+
+class ParameterizedAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: typing.Any, *args: typing.Any, **kwargs: typing.Any) -> typing.Any:
+        process, *p = args
+        input_p = [torch.nn.Parameter(t, requires_grad=t.requires_grad) for t in p]
+        ctx.process = process
+        ctx.save_for_backward(*p)
+        return process(*input_p)
+
+        # input_p = [torch.nn.Parameter(t, requires_grad=t.requires_grad) for t in p]
+        # with torch.enable_grad():
+        #     outputs = process(*input_p)
+        #     if isinstance(outputs, torch.Tensor):
+        #         outputs = [outputs]
+        #     os = [o.clone() for o in outputs]
+        # ctx.input_count = len(p)
+        # ctx.save_for_backward(*p, *input_p, *os)
+        # if not isinstance(outputs, torch.Tensor) and len(outputs) == 1:
+        #     return outputs[0]
+        # return outputs
+
+    @staticmethod
+    def backward(ctx: typing.Any, *grad_outputs: typing.Any) -> typing.Any:
+        process = ctx.process
+        p = list(ctx.saved_tensors)
+        with torch.enable_grad():
+            input_p = [torch.nn.Parameter(t, requires_grad=t.requires_grad) for t in p]
+            outputs = process(*input_p)
+            grads = torch.autograd.grad(outputs, input_p, grad_outputs, allow_unused=True)
+            # torch.autograd.backward(outputs, grad_outputs)
+        return None, *grads  #tuple(None if t.grad is None else t.grad.clone() for t in input_p)
+
+
+
+def parameterized_call(callable, *args):
+    assert callable is not None
+    return ParameterizedAutograd.apply(callable, *args)
+
 
 
 class StructModule(GPUDirectModule):
-    def __init__(self, accessor: ObjectBufferAccessor):
+    def __init__(self, accessor: vk.ObjectBufferAccessor):
         super().__init__(accessor)
 
 
@@ -1414,7 +1617,8 @@ class AutogradCaptureFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *args):
-        sensors, triggering, batch_size, fw_samples, bw_samples, field, capture_object, debug_out = args
+        sensors, batch_size, fw_samples, bw_samples, field, capture_object, debug_out, *parameters = args
+        ctx.save_for_backward(*parameters)
         ctx.field = field
         ctx.sensors = sensors
         ctx.capture_object = capture_object
@@ -1435,47 +1639,77 @@ class AutogradCaptureFunction(torch.autograd.Function):
         DispatcherEngine.eval_capture_backward(capture, field, output_grad, sensors, batch_size, bw_samples, debug_out)
         # print(f"[DEBUG] Backward grads from renderer {grad_inputs[0].mean()}")
         # assert grad_inputs[0] is None or torch.isnan(grad_inputs[0]).sum() == 0, "error in generated grads."
-        return (None, None, None, None, None, None, None, None)  # append None to refer to renderer object passed in forward
+        return (None, None, None, None, None, None, None) + tuple(p.grad for p in ctx.saved_tensors)  # append None to refer to renderer object passed in forward
 
 
-class Identity(MapBase):
+class ActivationMap(MapBase):
+    __extension_info__ = None
+
+    def __init__(self, dimension: typing.Optional[int] = None):
+        dims = { } if dimension is None else dict(INPUT_DIM=dimension, OUTPUT_DIM=dimension)
+        super().__init__(**dims)
+
+    def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+        assert input_dim is None or output_dim is None or input_dim == output_dim
+        cast_dim = input_dim or output_dim
+        if cast_dim is None:
+            return self
+        if not self.is_generic:
+            assert self.input_dim == cast_dim or self.input_dim == 1
+            if self.is_scalar_output and output_dim is not None and output_dim > 1:
+                return self.promote(output_dim)  # Automatic map promotion
+            return self
+        return type(self)(cast_dim)
+
+
+
+class Identity(ActivationMap):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__+"/maps/identity.h",
+        path=_internal.__INCLUDE_PATH__+"/maps/identity.h",
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
-
-    def __init__(self, dimension: int):
-        super(Identity, self).__init__(INPUT_DIM=dimension, OUTPUT_DIM=dimension)
-
-    def forward_torch(self, *args):
-        x, = args
-        return x
+    #
+    # def __init__(self, dimension: typing.Optional[int] = None):
+    #     dims = { } if dimension is None else dict(INPUT_DIM=dimension, OUTPUT_DIM=dimension)
+    #     super(Identity, self).__init__(**dims)
+    #
+    # def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+    #     assert input_dim is None or output_dim is None or input_dim == output_dim
+    #     cast_dim = input_dim or output_dim
+    #     if cast_dim is None:
+    #         return self
+    #     if not self.is_generic:
+    #         assert self.input_dim == cast_dim or self.input_dim == 1
+    #         if self.is_scalar_output and output_dim is not None and output_dim > 1:
+    #             return self.promote(output_dim)  # Automatic map promotion
+    #         return self
+    #     return Identity(cast_dim)
 
 
 class SensorsBase(MapBase):
     __extension_info__ = None  # Abstract node
 
-    def __init__(self, index_shape: List[int], **generics):
+    def __init__(self, index_shape: typing.List[int], **generics):
         super(SensorsBase, self).__init__(INPUT_DIM=len(index_shape), **generics)
         object.__setattr__(self, 'identity', Identity(self.output_dim))
         object.__setattr__(self, 'index_shape', torch.tensor(index_shape + ([0] * (4 - len(index_shape)))))
         object.__setattr__(self, '_rdv_trigger_bw', torch.tensor([0.0], requires_grad=True))
         object.__setattr__(self, '_rdv_no_trigger_bw', torch.tensor([0.0], requires_grad=False))
 
-    def measurement_point_dim(self):
-        return self.output_dim
+    # def measurement_point_dim(self):
+    #     return self.output_dim
 
-    def generate_measuring_points_torch(self, indices):
-        raise NotImplementedError()
+    # def generate_measuring_points_torch(self, indices):
+    #     raise NotImplementedError()
 
-    def forward_torch(self, *args):
-        if len(args) == 0 or args[0] is None:
-            dims = self.index_shape[:self.input_dim]
-            sensors = torch.cartesian_prod(
-                *[torch.arange(0, d, dtype=torch.long, device=torch.device('cuda:0')) for d in dims])
-        else:
-            sensors, = args
-        return self.generate_measuring_points_torch(sensors)
+    # def forward_torch(self, *args):
+    #     if len(args) == 0 or args[0] is None:
+    #         dims = self.index_shape[:self.input_dim]
+    #         sensors = torch.cartesian_prod(
+    #             *[torch.arange(0, d, dtype=torch.long, device=torch.device('cuda:0')) for d in dims])
+    #     else:
+    #         sensors, = args
+    #     return self.generate_measuring_points_torch(sensors)
 
     def forward(self, *args):
         '''
@@ -1489,30 +1723,32 @@ class SensorsBase(MapBase):
             sensors, = args
         return self.capture(self.identity, sensors, None, 1, 1)
 
-    def capture_torch(self, field: 'MapBase', sensors_batch: Optional[torch.Tensor] = None, fw_samples: int = 1):
-        # TODO: Implement a torch base replay backpropagation for stochastic processes
-        output = None
-        for _ in range(fw_samples):
-            points = self.forward_torch(sensors_batch)
-            if output is None:
-                output = field.forward_torch(points)
-            else:
-                output += field.forward_torch(points)
-        output /= fw_samples
-        if sensors_batch is None:
-            # reshape
-            output = output.view(*self.index_shape[:self.input_dim], -1)
-        return output
+    # def capture_torch(self, field: 'MapBase', sensors_batch: Optional[torch.Tensor] = None, fw_samples: int = 1):
+    #     # TODO: Implement a torch base replay backpropagation for stochastic processes
+    #     output = None
+    #     for _ in range(fw_samples):
+    #         points = self.forward_torch(sensors_batch)
+    #         if output is None:
+    #             output = field.forward_torch(points)
+    #         else:
+    #             output += field.forward_torch(points)
+    #     output /= fw_samples
+    #     if sensors_batch is None:
+    #         # reshape
+    #         output = output.view(*self.index_shape[:self.input_dim], -1)
+    #     return output
 
-    def capture(self, field: 'MapBase', sensors_batch: Optional[torch.Tensor] = None, batch_size: Optional[int] = None,
-                fw_samples: int = 1, bw_samples: int = 1, debug_out: Optional[torch.Tensor] = None):
-        if not __USE_VULKAN_DISPATCHER__:
-            return self.capture_torch(field, sensors_batch, fw_samples)
-        trigger_bw = self._rdv_trigger_bw if any(True for _ in self.parameters()) or any(
-            True for _ in field.parameters()) else self._rdv_no_trigger_bw
-        return AutogradCaptureFunction.apply(sensors_batch, trigger_bw, batch_size, fw_samples, bw_samples, field, self, debug_out)
+    def capture(self, field: 'MapBase', sensors_batch: typing.Optional[torch.Tensor] = None, batch_size: typing.Optional[int] = None,
+                fw_samples: int = 1, bw_samples: int = 1, debug_out: typing.Optional[torch.Tensor] = None):
+        # if not __USE_VULKAN_DISPATCHER__:
+        #     return self.capture_torch(field, sensors_batch, fw_samples)
+        field = field.cast(input_dim=self.output_dim)
+        triggers = [p for p in field.parameters() if p.requires_grad]
+        trigger_bw = self._rdv_trigger_bw #if any(True for _ in self.parameters()) or any(
+            # True for _ in field.parameters()) else self._rdv_no_trigger_bw
+        return AutogradCaptureFunction.apply(sensors_batch, batch_size, fw_samples, bw_samples, field, self, debug_out, *triggers)
 
-    def random_sensors(self, batch_size: int, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def random_sensors(self, batch_size: int, out: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
         # if out is not None:
         #     out.copy_((torch.rand(batch_size, self.input_dim, device=device()) * self.index_shape[:self.input_dim].to(
         #         device())).long())
@@ -1522,8 +1758,8 @@ class SensorsBase(MapBase):
         # return out
         if out is None:
             # out = torch.zeros(batch_size, self.input_dim, dtype=torch.long, device=device())
-            out = tensor(batch_size, self.input_dim, dtype=torch.long)
-        return random_ids(batch_size, self.index_shape[:self.input_dim], out=out)
+            out = vk.tensor(batch_size, self.input_dim, dtype=torch.long)
+        return _functions.random_ids(batch_size, self.index_shape[:self.input_dim], out=out)
 
 
 class PerspectiveCameraSensor(SensorsBase):
@@ -1537,53 +1773,67 @@ class PerspectiveCameraSensor(SensorsBase):
             znear=float
         ),
         generics=dict(OUTPUT_DIM=6),
-        path=__INCLUDE_PATH__+"/maps/perspective_camera_sensor.h"
+        path=_internal.__INCLUDE_PATH__+"/maps/sensor_perspective_camera.h"
     )
 
-    def __init__(self, width: int, height: int, poses: torch.Tensor, jittered: bool = False):
+    def __init__(self, width: int, height: int, poses: torch.Tensor, *, fov: float = np.pi / 4, jittered: bool = False):
         super(PerspectiveCameraSensor, self).__init__([len(poses), height, width])
         self.poses = poses
-        self.fov = np.pi / 4
+        self.fov = fov
         self.znear = 0.001
         self.width = width
         self.height = height
         self.generation_mode = 0 if not jittered else 1
 
-    def generate_measuring_points_torch(self, indices):
-        o = self.poses[indices[:, 0], 0:3]
-        d = self.poses[indices[:, 0], 3:6]
-        n = self.poses[indices[:, 0], 6:9]
-        dim = torch.tensor([self.height, self.width], dtype=torch.float, device=indices.device)
-        s = ((indices[:, 1:3] + 0.5) * 2 - dim) * self.znear / self.height
-        t = np.float32(self.znear / np.float32(np.tan(np.float32(self.fov) * np.float32(0.5))))
-        zaxis = vec3.normalize(d)
-        xaxis = vec3.normalize(vec3.cross(n, zaxis))
-        yaxis = vec3.cross(zaxis, xaxis)
-        w = xaxis * s[:, 1:2] + yaxis * s[:, 0:1] + zaxis * t
-        x = o + w
-        w = vec3.normalize(w)
-        return torch.cat([x, w], dim=-1)
+    # def generate_measuring_points_torch(self, indices):
+    #     o = self.poses[indices[:, 0], 0:3]
+    #     d = self.poses[indices[:, 0], 3:6]
+    #     n = self.poses[indices[:, 0], 6:9]
+    #     dim = torch.tensor([self.height, self.width], dtype=torch.float, device=indices.device)
+    #     s = ((indices[:, 1:3] + 0.5) * 2 - dim) * self.znear / self.height
+    #     t = np.float32(self.znear / np.float32(np.tan(np.float32(self.fov) * np.float32(0.5))))
+    #     zaxis = vec3.normalize(d)
+    #     xaxis = vec3.normalize(vec3.cross(n, zaxis))
+    #     yaxis = vec3.cross(zaxis, xaxis)
+    #     w = xaxis * s[:, 1:2] + yaxis * s[:, 0:1] + zaxis * t
+    #     x = o + w
+    #     w = vec3.normalize(w)
+    #     return torch.cat([x, w], dim=-1)
 
 
-class Composition(MapBase):
+class CompositionMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             inner=MapBase,
             outter=MapBase
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path=__INCLUDE_PATH__ + '/maps/composition.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/composition.h'
     )
 
     def __init__(self, inner: MapBase, outter: MapBase):
-        assert inner.output_dim == outter.input_dim
-        super(Composition, self).__init__(INPUT_DIM=inner.input_dim, INTERMEDIATE_DIM=inner.output_dim,
-                                          OUTPUT_DIM=outter.output_dim)
+        if inner.is_generic_output:
+            inner = inner.cast(output_dim=outter.input_dim)
+        if outter.is_generic_input:
+            outter = outter.cast(input_dim=inner.output_dim)
+        assert inner.is_generic_output or outter.is_generic_input or inner.output_dim == outter.input_dim
+        dims = {}
+        if not inner.is_generic_input:
+            dims.update(INPUT_DIM=inner.input_dim)
+        if not outter.is_generic_output:
+            dims.update(OUTPUT_DIM=outter.output_dim)
+        if not inner.is_generic_output:
+            dims.update(INTERMEDIATE_DIM=inner.output_dim)
+        super(CompositionMap, self).__init__(**dims)
         self.inner = inner
         self.outter = outter
 
-    def forward_torch(self, *args):
-        return self.outter.forward_torch(self.inner.forward_torch(*args))
+    def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+        inner = self.inner.cast(input_dim=input_dim)
+        outter = self.outter.cast(output_dim=output_dim)
+        if self.inner is inner and self.outter is outter:  # cast didnt change
+            return self
+        return CompositionMap(inner, outter)
 
 
 class CustomGradMap(MapBase):
@@ -1593,16 +1843,31 @@ class CustomGradMap(MapBase):
             bw=MapBase
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
-        path=__INCLUDE_PATH__ + '/maps/custom_grad.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/custom_grad.h'
     )
 
     def __init__(self, fw: MapBase, bw: MapBase):
-        assert fw.input_dim == bw.input_dim
-        assert fw.output_dim == bw.output_dim
-        super().__init__(INPUT_DIM=fw.input_dim, OUTPUT_DIM=fw.output_dim)
+        assert fw.is_generic_input or bw.is_generic_input or fw.input_dim == bw.input_dim
+        assert fw.is_generic_output or bw.is_generic_output or fw.output_dim == bw.output_dim
+        input_dim = fw.input_dim or bw.input_dim
+        output_dim = fw.output_dim or bw.output_dim
+        fw = fw.cast(input_dim, output_dim)
+        bw = bw.cast(input_dim, output_dim)
+        dims = {}
+        if input_dim is not None:
+            dims.update(INPUT_DIM=input_dim)
+        if output_dim is not None:
+            dims.update(OUTPUT_DIM=output_dim)
+        super().__init__(**dims)
         self.fw = fw
         self.bw = bw
 
+    def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+        fw = self.fw.cast(input_dim, output_dim)
+        bw = self.bw.cast(input_dim, output_dim)
+        if fw is self.fw and bw is self.bw:
+            return self
+        return CustomGradMap(fw, bw)
 
 
 
@@ -1621,45 +1886,72 @@ class BinaryOpMap(MapBase):
         )
 
     def __init__(self, map_a: MapBase, map_b: MapBase):
-        assert map_a.input_dim == map_b.input_dim
-        assert map_a.output_dim == map_b.output_dim
-        super(BinaryOpMap, self).__init__(INPUT_DIM=map_a.input_dim, OUTPUT_DIM=map_a.output_dim)
+        map_a, map_b = MapBase.match_input(map_a, map_b)
+        map_a, map_b = MapBase.match_output(map_a, map_b)
+        assert map_a.is_generic_input or map_b.is_generic_input or map_a.input_dim == map_b.input_dim
+        assert map_a.is_generic_output or map_b.is_generic_output or map_a.output_dim == map_b.output_dim
+        dims = {}
+        if not map_a.is_generic_input and not map_b.is_generic_input:
+            dims.update(INPUT_DIM = map_a.input_dim)
+        if not map_a.is_generic_output and not map_b.is_generic_output:
+            dims.update(OUTPUT_DIM = map_a.output_dim)
+        super(BinaryOpMap, self).__init__(**dims)
         self.map_a = map_a
         self.map_b = map_b
 
+    def cast(self, input_dim: typing.Optional[int] = None, output_dim: typing.Optional[int] = None):
+        map_a = self.map_a.cast(input_dim=input_dim, output_dim=output_dim)
+        map_b = self.map_b.cast(input_dim=input_dim, output_dim=output_dim)
+        if map_a is self.map_a and map_b is self.map_b:
+            return self
+        return type(self)(map_a, map_b)
+
 
 class AdditionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_add.h')
+    __extension_info__ = BinaryOpMap.create_extension_info(_internal.__INCLUDE_PATH__+'/maps/operator_add.h')
 
 
 class SubtractionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_sub.h')
+    __extension_info__ = BinaryOpMap.create_extension_info(_internal.__INCLUDE_PATH__+'/maps/operator_sub.h')
 
 
 class MultiplicationMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_mul.h')
+    __extension_info__ = BinaryOpMap.create_extension_info(_internal.__INCLUDE_PATH__+'/maps/operator_mul.h')
 
 
 class DivisionMap(BinaryOpMap):
-    __extension_info__ = BinaryOpMap.create_extension_info(__INCLUDE_PATH__+'/maps/operator_div.h')
+    __extension_info__ = BinaryOpMap.create_extension_info(_internal.__INCLUDE_PATH__+'/maps/operator_div.h')
 
 
-class PromoteMap(MapBase):
+class ComposePromoteMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(map=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
-        path=__INCLUDE_PATH__+'/maps/promote.h'
+        path=_internal.__INCLUDE_PATH__+'/maps/compose_promote.h'
     )
 
-    def __init__(self, map: MapBase, dim: int):
-        assert map.output_dim == 1, 'Promotion is only valid for single valued maps'
-        super(PromoteMap, self).__init__(INPUT_DIM=map.input_dim, OUTPUT_DIM=dim)
-        object.__setattr__(self, 'dim', dim)
+    def __init__(self, map: MapBase, dim: typing.Optional[int] = None):
+        map = map.cast(output_dim=1)
+        # assert map.output_dim == 1, 'Promotion is only valid for single valued maps'
+        dims = { 'INPUT_DIM': map.input_dim }
+        if dim is not None:
+            dims.update(OUTPUT_DIM=dim)
+        super(ComposePromoteMap, self).__init__(**dims)
         self.map = map
 
-    def forward_torch(self, *args):
-        t = self.map.forward_torch(*args)
-        return t.repeat([1] * len(t.shape[:-1]), self.dim)
+    def cast(self, input_dim: int = None, output_dim: int = None):
+        map = self.map.cast(input_dim=input_dim, output_dim=1)
+        assert self.input_dim is None or input_dim is None or input_dim == self.input_dim, f'Promotion cast to invalid input {input_dim}'
+        if not self.is_generic_output:
+            assert output_dim is None or self.output_dim == output_dim, f'Non-generic promotion cast to invalid output {output_dim}'
+            if map is self.map:
+                return self
+            return ComposePromoteMap(map, self.output_dim)
+        if output_dim is None:
+            if map is self.map:
+                return self
+            return ComposePromoteMap(map, self.output_dim)
+        return ComposePromoteMap(self.map, output_dim)
 
 
 class ConstantMap(MapBase):
@@ -1668,17 +1960,29 @@ class ConstantMap(MapBase):
             value=ParameterDescriptor
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path=__INCLUDE_PATH__+'/maps/constant.h'
+        path=_internal.__INCLUDE_PATH__+'/maps/constant.h'
     )
 
-    def __init__(self, input_dim: int, value: Union[torch.Tensor, torch.nn.Parameter]):
-        assert len(value.shape) == 1 and value.dtype == torch.float
-        super(ConstantMap, self).__init__(INPUT_DIM=input_dim, OUTPUT_DIM=value.numel())
+    def __init__(self, value: typing.Union[torch.Tensor, torch.nn.Parameter], input_dim: typing.Optional[int] = None):
+        assert len(value.shape) <= 1, f"Error {value.shape}"
+        assert value.dtype == torch.float
+        dims = {'OUTPUT_DIM': value.numel()}
+        if input_dim is not None:
+            dims.update(INPUT_DIM=input_dim)
+        super(ConstantMap, self).__init__(**dims)
         self.value = parameter(value)
 
-    def forward_torch(self, *args):
-        t, = args
-        return self.value.repeat(*t.shape[:-1], 1)
+    def cast(self, input_dim: int = None, output_dim: int = None):
+        assert output_dim is None or output_dim == self.output_dim or self.output_dim == 1, f'Constant map cast to an invalid output dim {output_dim} from {self.output_dim}'
+        c = self
+        if input_dim is not None:
+            assert self.is_generic_input or self.input_dim == input_dim
+            if self.is_generic_input:
+                c = ConstantMap(c.value, input_dim)
+        if output_dim is not None:
+            if self.output_dim == 1 and output_dim > 1:
+                c = c.promote(output_dim)
+        return c
 
 
 class ConcatMap(MapBase):
@@ -1688,7 +1992,7 @@ class ConcatMap(MapBase):
             map_b=MapBase
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.ALL,
-        path=__INCLUDE_PATH__ + '/maps/concat.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/concat.h'
     )
 
     def __init__(self, map_a: MapBase, map_b: MapBase):
@@ -1703,19 +2007,41 @@ class ConcatMap(MapBase):
         self.map_b = map_b
 
 
-class IndexMap(MapBase):
+class MatrixMultMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            matrix=ParameterDescriptor,
+            is_pre=int
+        ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
+        path=_internal.__INCLUDE_PATH__+'/maps/matmul.h'
+    )
+
+    def __init__(self, matrix: torch.Tensor, premul: bool = False):
+        assert len(matrix.shape) == 2
+        if premul:
+            dims = dict(INPUT_DIM=matrix.shape[1], OUTPUT_DIM=matrix.shape[0])
+        else:
+            dims = dict(INPUT_DIM=matrix.shape[0], OUTPUT_DIM=matrix.shape[1])
+        super().__init__(**dims)
+        self.matrix = parameter(matrix)
+        self.is_pre=int(premul)
+
+
+class ComposeSelectMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             map=MapBase,
             indices=[32, int]
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path=__INCLUDE_PATH__ + '/maps/index.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/compose_select.h'
     )
 
-    def __init__(self, map: MapBase, indices: List[int]):
-        assert all(i >= 0 and i<map.output_dim for i in indices)
-        super(IndexMap, self).__init__(
+    def __init__(self, map: MapBase, indices: typing.List[int]):
+        if map.output_dim is not None:
+            assert all(i >= 0 and i<map.output_dim for i in indices)
+        super(ComposeSelectMap, self).__init__(
             INPUT_DIM=map.input_dim,
             OUTPUT_DIM=len(indices),
             MAP_OUTPUT_DIM=map.output_dim
@@ -1724,16 +2050,24 @@ class IndexMap(MapBase):
         for i in range(len(indices)):
             self.indices[i] = indices[i]
 
+    # def cast(self, input_dim=None, output_dim=None):
+    #     m = self
+    #     if output_dim is not None:
+    #         assert output_dim == self.output_dim or self.output_dim == 1
+    #         if self.output_dim != output_dim:
+    #             m = self.promote(output_dim)
+
+
 
 class InputSelectMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             indices=[32, int]
         ),
-        path=__INCLUDE_PATH__+'/maps/input_select.h'
+        path=_internal.__INCLUDE_PATH__+'/maps/input_select.h'
     )
 
-    def __init__(self, input_dim: int, indices: List[int]):
+    def __init__(self, input_dim: int, indices: typing.List[int]):
         assert all(i >= 0 and i<input_dim for i in indices)
         super(InputSelectMap, self).__init__(
             INPUT_DIM=input_dim,
@@ -1742,6 +2076,28 @@ class InputSelectMap(MapBase):
         for i in range(len(indices)):
             self.indices[i] = indices[i]
 
+
+class InputPromoteMap(MapBase):
+    __extension_info__ = dict(
+        parameters=dict(
+            indices=[32, int]
+        ),
+        path=_internal.__INCLUDE_PATH__+'/maps/input_promote.h',
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
+    )
+
+    def __init__(self, output_dim: int):
+        super(InputPromoteMap, self).__init__(
+            INPUT_DIM=1,
+            OUTPUT_DIM=output_dim
+        )
+
+
+class ReluMap(ActivationMap):
+    __extension_info__ = dict(
+        path=_internal.__INCLUDE_PATH__ + '/maps/relu.h',
+        bw_implementations = BACKWARD_IMPLEMENTATIONS.DEFAULT
+    )
 
 
 # Sensors
@@ -1837,7 +2193,7 @@ class Grid3DSensor(SensorsBase):
             sd=float
         ),
         generics=dict(OUTPUT_DIM=3),
-        path=__INCLUDE_PATH__ + '/maps/grid3d_sensor.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/sensor_grid3d.h'
     )
 
     def __init__(self, width: int, height: int, depth: int = 1, box_min: vec3 = vec3(-1.0, -1.0, -1.0),
@@ -1866,7 +2222,7 @@ class Box3DSensor(SensorsBase):
             box_max=vec3
         ),
         generics=dict(OUTPUT_DIM=3),
-        path=__INCLUDE_PATH__ + '/maps/box_sensor.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/sensor_box.h'
     )
 
     def __init__(self, samples, box_min: vec3 = vec3(-1.0, -1.0, -1.0), box_max: vec3 = vec3(1.0, 1.0, 1.0)):
@@ -1907,10 +2263,10 @@ class Grid2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        path=__INCLUDE_PATH__ + '/maps/grid2d.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/grid2d.h'
     )
 
-    def __init__(self, grid: Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
+    def __init__(self, grid: typing.Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
         assert len(grid.shape) == 3
         super(Grid2D, self).__init__(OUTPUT_DIM=grid.shape[-1])
         self.grid = parameter(grid)
@@ -1937,10 +2293,11 @@ class Image2D(MapBase):
             inv_bsize=vec2
         ),
         generics=dict(INPUT_DIM=2),
-        path=__INCLUDE_PATH__ + '/maps/image2d.h'
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
+        path=_internal.__INCLUDE_PATH__ + '/maps/image2d.h'
     )
 
-    def __init__(self, grid: Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
+    def __init__(self, grid: typing.Union[torch.Tensor, torch.nn.Parameter], bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
         assert len(grid.shape) == 3
         super(Image2D, self).__init__(OUTPUT_DIM=grid.shape[-1])
         self.grid = parameter(grid)
@@ -1968,7 +2325,7 @@ class Grid3D(MapBase):
             inv_bsize=vec3
         ),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path=__INCLUDE_PATH__ + '/maps/grid3d.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/grid3d.h'
     )
 
     def __init__(self, grid: torch.Tensor, bmin: vec3 = vec3(-1.0, -1.0, -1.0), bmax: vec3 = vec3(1.0, 1.0, 1.0)):
@@ -2012,40 +2369,40 @@ class Transformed3DMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             base_map=MapBase,
-            transform=mat4,
-            inverse_transform=mat4
+            transform=vk.mat4,
+            inverse_transform=vk.mat4
         ),
         generics=dict(INPUT_DIM=3),
         bw_implementations = BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path = __INCLUDE_PATH__ + '/maps/transform_3D_map.h'
+        path = _internal.__INCLUDE_PATH__ + '/maps/transform_3D_map.h'
     )
 
-    def __init__(self, base_map: MapBase, transform: mat4 ):
+    def __init__(self, base_map: MapBase, transform: vk.mat4 ):
         assert base_map.input_dim == 3
         super().__init__(OUTPUT_DIM=base_map.output_dim)
         self.base_map = base_map
         self.transform = transform
-        self.inverse_transform = mat4.inverse(transform)
+        self.inverse_transform = vk.mat4.inverse(transform)
 
 
 class TransformedRayMap(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             base_map=MapBase,
-            transform=mat4,
-            inverse_transform=mat4
+            transform=vk.mat4,
+            inverse_transform=vk.mat4
         ),
         generics=dict(INPUT_DIM=6),
         bw_implementations = BACKWARD_IMPLEMENTATIONS.DEFAULT,
-        path = __INCLUDE_PATH__ + '/maps/transform_ray_map.h'
+        path = _internal.__INCLUDE_PATH__ + '/maps/transform_ray_map.h'
     )
 
-    def __init__(self, base_map: MapBase, transform: mat4 ):
+    def __init__(self, base_map: MapBase, transform: vk.mat4 ):
         assert base_map.input_dim == 6
         super().__init__(OUTPUT_DIM=base_map.output_dim)
         self.base_map = base_map
         self.transform = transform
-        self.inverse_transform = mat4.inverse(transform)
+        self.inverse_transform = vk.mat4.inverse(transform)
 
 
 class XRProjection(MapBase):
@@ -2055,7 +2412,7 @@ class XRProjection(MapBase):
         generics=dict(
             OUTPUT_DIM=2
         ),
-        path=__INCLUDE_PATH__ + '/maps/xr_projection.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/xr_projection.h'
     )
 
     def __init__(self, ray_input: bool = False):
@@ -2081,7 +2438,7 @@ class OctProjection(MapBase):
         generics=dict(
             OUTPUT_DIM=2
         ),
-        path=__INCLUDE_PATH__ + '/maps/oct_projection.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/oct_projection.h'
     )
 
     def __init__(self, ray_input: bool = False):
@@ -2096,7 +2453,7 @@ class OctUnprojection(MapBase):
             INPUT_DIM=2,
             OUTPUT_DIM=3
         ),
-        path=__INCLUDE_PATH__ + '/maps/oct_unprojection.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/oct_unprojection.h'
     )
 
 
@@ -2104,7 +2461,7 @@ class UniformSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
-        path=__INCLUDE_PATH__+'/maps/uniform_sampler.h'
+        path=_internal.__INCLUDE_PATH__+'/maps/uniform_sampler.h'
     )
 
     def __init__(self, input_dim, point_dim):
@@ -2115,7 +2472,7 @@ class GaussianSampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
         ),
-        path=__INCLUDE_PATH__ + '/maps/gaussian_sampler.h'
+        path=_internal.__INCLUDE_PATH__ + '/maps/gaussian_sampler.h'
     )
 
     def __init__(self, input_dim, output_dim):
@@ -2127,7 +2484,7 @@ class UniformDirectionSampler(MapBase):
         parameters=dict(
         ),
         generics=dict(OUTPUT_DIM=4),
-        path=__INCLUDE_PATH__ +'/maps/uniform_direction_sampler.h'
+        path=_internal.__INCLUDE_PATH__ +'/maps/uniform_direction_sampler.h'
     )
 
     def __init__(self, input_dim):
@@ -2192,7 +2549,7 @@ class XRQuadtreeRandomDirection(MapBase):
         self.levels = levels
 
 
-class FunctionSampler(MapBase):
+class _functionsampler(MapBase):
     __extension_info__ = dict(
         parameters=dict(
             point_sampler=MapBase,
@@ -2218,7 +2575,7 @@ FORWARD
     )
     def __init__(self, point_sampler: MapBase, function_map: MapBase):
         assert point_sampler.output_dim - 1 == function_map.input_dim
-        super(FunctionSampler, self).__init__(
+        super(_functionsampler, self).__init__(
             INPUT_DIM=point_sampler.input_dim,
             OUTPUT_DIM=point_sampler.output_dim - 1 + function_map.output_dim,
             FUNCTION_INPUT_DIM=function_map.input_dim,
@@ -2237,7 +2594,7 @@ class GridRatiotrackingTransmittance(MapBase):
             box_max=vec3,
             boundary=MapBase
         ),
-        path=__INCLUDE_PATH__ + "/maps/transmittance_grt.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_grt.h",
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
@@ -2246,7 +2603,17 @@ class GridRatiotrackingTransmittance(MapBase):
         self.grid = grid.grid
         self.box_min = grid.bmin.clone()
         self.box_max = grid.bmax.clone()
-        self.boundary = boundary
+        self.boundary = boundary.cast(6, 2)
+
+    def update_grid(self, grid: typing.Optional[Grid3D] = None):
+        if grid is None:
+            assert self.grid_model is not None
+            grid = self.grid_model
+        else:
+            self.grid_model = grid
+        self.grid = grid.grid
+        self.box_min = grid.bmin.clone()
+        self.box_max = grid.bmax.clone()
 
 
 class GridDeltatrackingTransmittance(MapBase):
@@ -2258,7 +2625,7 @@ class GridDeltatrackingTransmittance(MapBase):
             box_max=vec3,
             boundary=MapBase
         ),
-        path=__INCLUDE_PATH__ + "/maps/transmittance_gdt.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_gdt.h",
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
@@ -2279,22 +2646,30 @@ class GridDDATransmittance(MapBase):
             box_max=vec3,
             boundary=MapBase
         ),
-        path=__INCLUDE_PATH__ + "/maps/transmittance_dda.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_dda.h",
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
     )
 
     def __init__(self, grid: Grid3D, boundary: MapBase):
         super(GridDDATransmittance, self).__init__()
-        self.grid_model = grid
+        self.boundary = boundary
+        self.grid_model = None
+        self.update_grid(grid)
+
+    def update_grid(self, grid: typing.Optional[Grid3D] = None):
+        if grid is None:
+            assert self.grid_model is not None
+            grid = self.grid_model
+        else:
+            self.grid_model = grid
         self.grid = grid.grid
         self.box_min = grid.bmin.clone()
         self.box_max = grid.bmax.clone()
-        self.boundary = boundary
 
 
 class RatiotrackingTransmittance(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/transmittance_rt.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_rt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2302,14 +2677,14 @@ class RatiotrackingTransmittance(MapBase):
 
     def __init__(self, sigma: MapBase, boundary: MapBase, majorant: MapBase):
         super(RatiotrackingTransmittance, self).__init__()
-        self.sigma = sigma
-        self.boundary = boundary
-        self.majorant = majorant
+        self.sigma = sigma.cast(3, 1)
+        self.boundary = boundary.cast(6, 2)
+        self.majorant = majorant.cast(6, 2)
 
 
 class DeltatrackingTransmittance(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/transmittance_dt.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_dt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2324,7 +2699,7 @@ class DeltatrackingTransmittance(MapBase):
 
 class RaymarchingTransmittance(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/transmittance_rm.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/transmittance_rm.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=1),
         parameters=dict(sigma=MapBase, boundary=MapBase, step=float),
     )
@@ -2338,7 +2713,7 @@ class RaymarchingTransmittance(MapBase):
 
 class DeltatrackingCollisionSampler(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/collision_sampler_dt.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/collision_sampler_dt.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(sigma=MapBase, boundary=MapBase, majorant=MapBase, ds_epsilon=float),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2354,7 +2729,7 @@ class DeltatrackingCollisionSampler(MapBase):
 
 class MCScatteredRadiance(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/scattered_radiance_mc.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/scattered_radiance_mc.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(scattering_albedo=MapBase, phase_sampler=MapBase, radiance=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2369,7 +2744,7 @@ class MCScatteredRadiance(MapBase):
 
 class MCScatteredEmittedRadiance(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + "/maps/scattered_emitted_radiance_mc.h",
+        path=_internal.__INCLUDE_PATH__ + "/maps/scattered_emitted_radiance_mc.h",
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(scattering_albedo=MapBase, emission=MapBase, phase_sampler=MapBase, radiance=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2383,6 +2758,33 @@ class MCScatteredEmittedRadiance(MapBase):
         self.radiance = radiance
 
 
+class SingleScatteredRadiance(MapBase):
+    __extension_info__ = dict(
+        path=_internal.__INCLUDE_PATH__ + "/maps/single_scattered_radiance_mc.h",
+        generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
+        parameters=dict(
+            scattering_albedo=MapBase,
+            phase=MapBase,
+            environment_sampler=MapBase,
+            transmittance=MapBase
+        ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
+    )
+
+    def __init__(self,
+                 scattering_albedo: MapBase,
+                 phase: MapBase,
+                 environment_sampler: MapBase,
+                 transmittance: MapBase
+                 ):
+        super(SingleScatteredRadiance, self).__init__()
+        self.scattering_albedo = scattering_albedo.cast(3, 3)
+        self.phase = phase.cast(9, 1)
+        self.environment_sampler = environment_sampler.cast(6, 6)
+        self.transmittance = transmittance.cast(6, 1)
+
+
+
 class MCCollisionIntegrator(MapBase):
     '''
     Montecarlo solver for
@@ -2393,7 +2795,7 @@ class MCCollisionIntegrator(MapBase):
     environment: :math:`B(w)`
     '''
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/collision_integrator_mc.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/collision_integrator_mc.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(collision_sampler=MapBase, exitance_radiance=MapBase, environment=MapBase),
         bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
@@ -2416,7 +2818,7 @@ class GridDDACollisionIntegrator(MapBase):
     environment: :math:`B(w)`
     '''
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/collision_integrator_dda.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/collision_integrator_dda.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             grid=ParameterDescriptor,
@@ -2431,18 +2833,59 @@ class GridDDACollisionIntegrator(MapBase):
 
     def __init__(self, sigma_grid: Grid3D, exitance_radiance: MapBase, environment: MapBase, boundary: MapBase):
         super(GridDDACollisionIntegrator, self).__init__()
-        self.sigma_grid = sigma_grid
+        self.sigma_grid = sigma_grid.cast(3, 1)
         self.grid = sigma_grid.grid
         self.box_min = sigma_grid.bmin.clone()
         self.box_max = sigma_grid.bmax.clone()
-        self.exitance_radiance = exitance_radiance
-        self.environment = environment
-        self.boundary = boundary
+        self.exitance_radiance = exitance_radiance.cast(6, 3)
+        self.environment = environment.cast(3, 3)
+        self.boundary = boundary.cast(6, 2)
+
+    def update_grid(self, grid: typing.Optional[Grid3D] = None):
+        if grid is None:
+            assert self.sigma_grid is not None
+            grid = self.sigma_grid
+        self.sigma_grid = grid
+        self.grid = grid.grid
+        self.box_min = grid.bmin.clone()
+        self.box_max = grid.bmax.clone()
+
+
+class DeltatrackingScatteringSampler(MapBase):
+    __extension_info__ = dict(
+        path=_internal.__INCLUDE_PATH__ + '/maps/path_sampler_DT.h',
+        generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),  # x,w -> Wo * Env(wo)
+        parameters=dict(
+            sigma=MapBase,
+            scattering_albedo=MapBase,
+            phase_sampler=MapBase,
+            environment=MapBase,
+            boundary=MapBase,
+            majorant=MapBase
+        ),
+        bw_implementations=BACKWARD_IMPLEMENTATIONS.DEFAULT
+    )
+
+    def __init__(self,
+                 sigma: MapBase,
+                 scattering_albedo: MapBase,
+                 phase_sampler: MapBase,
+                 environment: MapBase,
+                 boundary: MapBase,
+                 majorant: MapBase
+                 ):
+        super().__init__()
+        self.sigma = sigma.cast(3, 1)
+        self.scattering_albedo = scattering_albedo.cast(3, 3)
+        self.phase_sampler = phase_sampler.cast(6, 4)
+        self.environment = environment.cast(3, 3)
+        self.boundary = boundary.cast(6, 2)
+        self.majorant = majorant.cast(6, 2)
 
 
 class DeltatrackingPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_DT.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_DT.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2480,7 +2923,7 @@ class DeltatrackingPathIntegrator(MapBase):
 
 class DeltatrackingNEEPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_NEE_DS.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_NEE_DS.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2511,6 +2954,16 @@ class DeltatrackingNEEPathIntegrator(MapBase):
                  transmittance: MapBase,
                  ds_epsilon: float
                  ):
+        sigma = sigma.cast(3, 1)
+        scattering_albedo = scattering_albedo.cast(3, 3)
+        emission = emission.cast(6, 3)
+        environment = environment.cast(3, 3)
+        environment_sampler = environment_sampler.cast(6, 6)
+        phase = phase.cast(9, 1)
+        phase_sampler = phase_sampler.cast(6, 4)
+        boundary = boundary.cast(6, 2)
+        majorant = majorant.cast(6, 2)
+        transmittance = transmittance.cast(6, 1)
         super(DeltatrackingNEEPathIntegrator, self).__init__()
         self.sigma = sigma
         self.scattering_albedo = scattering_albedo
@@ -2527,7 +2980,7 @@ class DeltatrackingNEEPathIntegrator(MapBase):
 
 class DRTPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_NEE_DRT.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_NEE_DRT.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2557,21 +3010,21 @@ class DRTPathIntegrator(MapBase):
                  transmittance: MapBase
                  ):
         super(DRTPathIntegrator, self).__init__()
-        self.sigma = sigma
-        self.scattering_albedo = scattering_albedo
-        self.emission = emission
-        self.environment = environment
-        self.environment_sampler = environment_sampler
-        self.phase = phase
-        self.phase_sampler = phase_sampler
-        self.boundary = boundary
-        self.majorant = majorant
-        self.transmittance = transmittance
+        self.sigma = sigma.cast(input_dim=3, output_dim=1)
+        self.scattering_albedo = scattering_albedo.cast(input_dim=3, output_dim=3)
+        self.emission = emission.cast(input_dim=6, output_dim=3)
+        self.environment = environment.cast(input_dim=3, output_dim=3)
+        self.environment_sampler = environment_sampler.cast(input_dim=6, output_dim=6)
+        self.phase = phase.cast(9, 1)
+        self.phase_sampler = phase_sampler.cast(6, 4)
+        self.boundary = boundary.cast(6, 2)
+        self.majorant = majorant.cast(6, 2)
+        self.transmittance = transmittance.cast(6, 1)
 
 
 class DRTQPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_NEE_DRTQ.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_NEE_DRTQ.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2616,7 +3069,7 @@ class DRTQPathIntegrator(MapBase):
 
 class DRTDSPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_NEE_DRTDS.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_NEE_DRTDS.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2664,7 +3117,7 @@ class DRTDSPathIntegrator(MapBase):
 
 class SPSPathIntegrator(MapBase):
     __extension_info__ = dict(
-        path=__INCLUDE_PATH__ + '/maps/radiance_NEE_SPS.h',
+        path=_internal.__INCLUDE_PATH__ + '/maps/radiance_NEE_SPS.h',
         generics=dict(INPUT_DIM=6, OUTPUT_DIM=3),
         parameters=dict(
             sigma=MapBase,
@@ -2694,17 +3147,16 @@ class SPSPathIntegrator(MapBase):
                  transmittance: MapBase
                  ):
         super(SPSPathIntegrator, self).__init__()
-        self.sigma = sigma
-        self.scattering_albedo = scattering_albedo
-        self.emission = emission
-        self.environment = environment
-        self.environment_sampler = environment_sampler
-        self.phase = phase
-        self.phase_sampler = phase_sampler
-        self.boundary = boundary
-        self.majorant = majorant
-        self.transmittance = transmittance
-
+        self.sigma = sigma.cast(input_dim=3, output_dim=1)
+        self.scattering_albedo = scattering_albedo.cast(input_dim=3, output_dim=3)
+        self.emission = emission.cast(input_dim=6, output_dim=3)
+        self.environment = environment.cast(input_dim=3, output_dim=3)
+        self.environment_sampler = environment_sampler.cast(input_dim=6, output_dim=6)
+        self.phase = phase.cast(9, 1)
+        self.phase_sampler = phase_sampler.cast(6, 4)
+        self.boundary = boundary.cast(6, 2)
+        self.majorant = majorant.cast(6, 2)
+        self.transmittance = transmittance.cast(6, 1)
 
 # --------------------
 
@@ -2786,6 +3238,7 @@ class RayToSegment(MapBase):
     )
 
     def __init__(self, distance_field: 'MapBase'):
+        distance_field = distance_field.cast(input_dim=6, output_dim=1)
         super(RayToSegment, self).__init__()
         self.distance_field = distance_field
 
@@ -3994,15 +4447,17 @@ FORWARD
 {
     float _g[1];
     forward(parameters.phase_g, float[3](_input[0], _input[1], _input[2]), _g);
-    float g = _g[0];    
-    _output[0] = hg_phase_eval(vec3(_input[3], _input[4], _input[5]), vec3(_input[6], _input[7], _input[8]), g);
+    float g = _g[0];
+    vec3 w1 = vec3(_input[3], _input[4], _input[5]);
+    vec3 w2 = vec3(_input[6], _input[7], _input[8]);
+    _output[0] = mix(hg_phase_eval(w1, w2, g), hg_phase_eval(w1, w2, g/5), 0.2); 
 }
         """
     )
 
     def __init__(self, phase_g: MapBase):
         super(HGPhase, self).__init__()
-        self.phase_g = phase_g
+        self.phase_g = phase_g.cast(3, 1)
 
 
 class VHGPhaseSampler(MapBase):
@@ -4017,6 +4472,8 @@ FORWARD
     float g[1];
     forward(parameters.phase_g, float[3](_input[0], _input[1], _input[2]), g);
     
+    if (random() < 0.8)
+        g[0] /= 5;
     vec3 w_out = hg_phase_sample(vec3(_input[3], _input[4], _input[5]), g[0]);
     _output = float[4](1.0, w_out.x, w_out.y, w_out.z);
 }
@@ -4024,7 +4481,7 @@ FORWARD
     )
     def __init__(self, phase_g: MapBase):
         super().__init__()
-        self.phase_g = phase_g
+        self.phase_g = phase_g.cast(3, 1)
 
 
 class HGDirectionSampler(MapBase):
@@ -4300,7 +4757,27 @@ void volume_radiance_bw(map_object, vec3 x, vec3 w, vec3 dL_dR)
 #         return A, W
 
 
-def normalized_box(s: Union[torch.Tensor, List]) -> Tuple[vec3, vec3]:
+class ParametricMap(object):
+    def __init__(self, t):
+        object.__setattr__(self, '_factory', t)
+
+    def __getitem__(self, item):
+        t = object.__getattribute__(self, '_factory')
+        if not isinstance(item, tuple):
+            item = [item]
+        if isinstance(item[-1], dict):
+            kwargs = item[-1]
+            item = item[:-1]
+        else:
+            kwargs = {}
+        return t(*item, **kwargs)
+
+    def __getattr__(self, item):
+        raise Exception('Parameters to a parametric map must be provided before using, e.g.: map[1.0, 2.0]')
+
+
+
+def normalized_box(s: typing.Union[torch.Tensor, typing.List]) -> typing.Tuple[vec3, vec3]:
     if isinstance(s, torch.Tensor):
         shape = s.shape
     else:
@@ -4310,19 +4787,31 @@ def normalized_box(s: Union[torch.Tensor, List]) -> Tuple[vec3, vec3]:
     b_min = -b_max
     return (b_min, b_max)
 
-def zero(dim):
-    raise NotImplementedError()
 
-def one(dim):
-    raise NotImplementedError()
-
-def constant(input_dim, *args):
+def _const_factory(*args, input_dim: typing.Optional[int] = None):
+    """
+    args: float values for the constant or a single torch.Tensor object
+    """
     if len(args) == 1 and isinstance(args[0], torch.Tensor):
-        return ConstantMap(input_dim=input_dim, value=args[0])
-    return ConstantMap(input_dim=input_dim, value=torch.tensor([*args], device=device(), dtype=torch.float))
+        return ConstantMap(value=args[0], input_dim=input_dim)
+    return ConstantMap(value=torch.tensor([*args], device=_internal.device(), dtype=torch.float), input_dim=input_dim)
 
-def ray_to_segment(distance_field: 'MapBase'):
-    return RayToSegment(distance_field)
+const = ParametricMap(_const_factory)
+"""
+Constant map with a specific value.
+examples:
+const[1.0, 2.0]
+const[p]  # with p a tensor or a parameter
+const[1.0, 2.0, 3.0, dict(input_dim=5)]  # Non generic constant map for R^5 inputs evaluating (1.0, 2.0, 3.0)
+"""
+
+ray_to_segment = ParametricMap(RayToSegment) # (distance_field: 'MapBase'):
+"""
+Given a ray xw and a distance field d(xw) return x + w * d(xw)
+Example:
+ray_to_segment[ray_box_intersect[1]]
+"""
+    # return RayToSegment(distance_field)
 
 def grid2d(t: torch.Tensor, bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.0, 1.0)):
     return Grid2D(t, bmin, bmax)
@@ -4333,7 +4822,7 @@ def image2d(t: torch.Tensor, bmin: vec2 = vec2(-1.0, -1.0), bmax: vec2 = vec2(1.
 def grid3d(t: torch.Tensor, bmin: vec3 = vec3(-1.0, -1.0, -1.0), bmax: vec3 = vec3(1.0, 1.0, 1.0)):
     return Grid3D(t, bmin, bmax)
 
-def transmittance(sigma: 'MapBase', majorant: float = None, mode: Literal['dt', 'rt'] = 'rt'):
+def transmittance(sigma: 'MapBase', majorant: float = None, mode: typing.Literal['dt', 'rt'] = 'rt'):
     if majorant is None:
         assert isinstance(sigma, Grid3D)
         majorant = sigma.grid.max().item()
@@ -4343,11 +4832,33 @@ def transmittance(sigma: 'MapBase', majorant: float = None, mode: Literal['dt', 
         return TransmittanceDT(sigma, majorant)
     raise Exception()
 
-def xr_projection(ray_input: bool = False):
-    return XRProjection(ray_input=ray_input)
+xr_projection = XRProjection(False)
+"""
+Equirectangular projection of a direction. 
+"""
 
-def oct_inv_projection():
-    return OctUnprojection()
+xr_ray_projection = XRProjection(True)
+"""
+Equirectangular projection of a ray. 
+"""
+
+# def xr_projection(ray_input: bool = False):
+#     return XRProjection(ray_input=ray_input)
+
+oct_inv_projection = OctUnprojection()
+"""
+Octahedral inverse projection, from square to direction.
+"""
+
+oct_projection = OctProjection()
+"""
+Octahedral projection, from direction to square.
+"""
+
+oct_ray_projection = OctProjection(ray_input=True)
+"""
+Octahedral projection, from ray to square.
+"""
 
 def tsr(cls, translate: vec3 = vec3(0.0, 0.0, 0.0), scale: vec3 = vec3(1.0, 1.0, 1.0), rotatation_axis: vec3 = vec3(0.0, 1.0, 0.0), rotation_angle: float = 0.0):
     raise NotImplementedError()
@@ -4367,14 +4878,45 @@ def spherical_projection(cls):
 def cylindrical_projection(cls):
     raise NotImplementedError()
 
-def identity(input_dim: int):
-    return Identity(input_dim)
+# def identity(input_dim: typing.Optional[int] = None):
+#     return Identity(input_dim)
 
-def ray_position():
-    return RayPosition()
+X = Identity()
+"""
+Represents an identity map. Used to represent y=x and compose and operate with other maps.
+example: doubled_map = 2 * X
+"""
 
-def ray_direction():
-    return RayDirection()
+ZERO = const[0.0]
+"""
+Constant map 0.0
+"""
 
-def ray_box_intersection(bmin: vec3, bmax: vec3):
-    return RayBoxIntersection(box_min=bmin, box_max=bmax)
+ONE = const[1.0]
+"""
+Constant map 1.0
+"""
+
+ray_position = RayPosition()
+"""
+Assumes the input in the form x|w and return x
+"""
+
+ray_direction = RayDirection()
+"""
+Assumes the input in the form x|w and return w
+"""
+
+ray_box_intersection = ParametricMap(RayBoxIntersection)
+"""
+Given a ray returns the two intersection distance with a specific box bmin: vec3, bmax: vec3.
+"""
+
+
+relu = ReluMap()
+"""
+Performs relu activation on all values of input.
+"""
+
+# def ray_box_intersection(bmin: vec3, bmax: vec3):
+#     return RayBoxIntersection(box_min=bmin, box_max=bmax)

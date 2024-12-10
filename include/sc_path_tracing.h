@@ -296,7 +296,8 @@ void path_trace_bw(map_object, vec3 x, vec3 w, vec3 out_A, vec3 dL_dA)
             vec3 dL_dvW = dL_dA * rem_A / vW;
             dL_dvW = mix(dL_dvW, vec3(0.0), isnan(dL_dvW));
             SET_SEED(before_medium_traversal);
-            medium_traversal_bw(object, current_medium, x, w, d, vW, vA, dL_dvW, dL_dvA);
+            medium_traversal_bw(object, current_medium, x, w, d, dL_dvW, dL_dvA);
+            //medium_traversal_bw(object, current_medium, x, w, d, vW, vA, dL_dvW, dL_dvA);
             ASSERT(get_seed() == SEED(after_medium_traversal), "sc_path_tracing.h: Seed inconsistency during medium traversal")
             //SET_SEED(after_medium_traversal);
             W *= vW;

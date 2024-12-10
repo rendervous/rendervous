@@ -1,8 +1,7 @@
-from ._internal import FunctionBase, device  #, ExtensionRendererModule
-from .rendering import tensor, tensor_like, wrap_gpu
-from typing import Tuple, Optional
+from . import _internal
+import typing
 import torch
-from rendervous.rendering._gmath import vec3
+import vulky as vk
 import os
 import math
 import numpy as np
@@ -12,7 +11,7 @@ import random
 __FUNCTIONS_FOLDER__ = os.path.dirname(__file__).replace('\\', '/') + "/include/functions"
 
 
-class _oct_inv_projection(FunctionBase):
+class _oct_inv_projection(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + '/tools/oct_inv_projection.comp.glsl',
         parameters = dict(
@@ -21,12 +20,12 @@ class _oct_inv_projection(FunctionBase):
         )
     )
 
-    def bind(self, coordinates: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, coordinates: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         if out is None:
-            out = tensor(*coordinates.shape[:-1], 3, dtype=torch.float)
+            out = vk.tensor(*coordinates.shape[:-1], 3, dtype=torch.float)
             # out = torch.zeros(N, len(shape), dtype=torch.long)
-        self.out_tensor = wrap_gpu(out, 'out')
-        self.in_tensor = wrap_gpu(coordinates, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(coordinates, 'in')
         return (math.prod(coordinates.shape[:-1]), 1, 1)
 
     def result(self) -> torch.Tensor:
@@ -35,7 +34,7 @@ class _oct_inv_projection(FunctionBase):
         return self.out_tensor.obj
 
 
-def oct_inv_projection(coordinates: torch.Tensor, out: Optional[torch.Tensor] = None):
+def oct_inv_projection(coordinates: torch.Tensor, out: typing.Optional[torch.Tensor] = None):
     return _oct_inv_projection.eval(coordinates, out=out)
 
 
@@ -43,7 +42,7 @@ def random_sphere_points(N, *, seed: int = 13, radius: float = 1.0):
     torch.manual_seed(seed)
     samples = torch.randn(N, 3)
     samples /= torch.sqrt((samples ** 2).sum(-1, keepdim=True))
-    return vec3(samples * radius)
+    return vk.vec3(samples * radius)
 
 
 def random_equidistant_sphere_points(N, *, seed: int = 13, radius: float = 1.0):
@@ -57,33 +56,33 @@ def random_equidistant_sphere_points(N, *, seed: int = 13, radius: float = 1.0):
     CAMERAS = kmeans.cluster_centers_
     CAMERAS /= np.sqrt((CAMERAS ** 2).sum(-1, keepdims=True))
     CAMERAS *= radius
-    return torch.as_tensor(CAMERAS, device=device())
+    return torch.as_tensor(CAMERAS, device=_internal.device())
 
 
 def random_equidistant_camera_poses(N, *, seed: int = 13, radius: float = 1.0):
     origins = random_equidistant_sphere_points(N, seed=seed, radius=radius)
-    camera_poses_tensor = torch.zeros(N, 9, device=device())
+    camera_poses_tensor = torch.zeros(N, 9, device=_internal.device())
     camera_poses_tensor[:, 0:3] = origins
-    camera_poses_tensor[:, 3:6] = vec3.normalize(-1*origins)
+    camera_poses_tensor[:, 3:6] = vk.vec3.normalize(-1*origins)
     camera_poses_tensor[:, 7] = 1.0
     return camera_poses_tensor
 
 
 def oct_camera_poses(N, *, seed: int = 13, radius: float = 1.0):
     with torch.no_grad():
-        u = torch.arange(-1.0 + 1.0/N, 1.0, 2.0/N, device=device())
+        u = torch.arange(-1.0 + 1.0/N, 1.0, 2.0/N, device=_internal.device())
         c = torch.cartesian_prod(u, u)
         origins =  oct_inv_projection(c) * radius
         # origins = random_equidistant_sphere_points(N, seed=seed, radius=radius)
-        camera_poses_tensor = torch.zeros(N*N, 9, device=device())
+        camera_poses_tensor = torch.zeros(N*N, 9, device=_internal.device())
         camera_poses_tensor[:, 0:3] = origins
-        camera_poses_tensor[:, 3:6] = vec3.normalize(-1*origins)
+        camera_poses_tensor[:, 3:6] = vk.vec3.normalize(-1*origins)
         camera_poses_tensor[:, 7] = 1.0
         return camera_poses_tensor
 
 
 
-class _dummy_function(FunctionBase):
+class _dummy_function(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + '/dummy_example/forward.comp.glsl',
         parameters = dict(
@@ -94,13 +93,13 @@ class _dummy_function(FunctionBase):
         )
     )
 
-    def bind(self, a: torch.Tensor, b: torch.Tensor, alpha: float = 1.0, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, a: torch.Tensor, b: torch.Tensor, alpha: float = 1.0, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         self.alpha = alpha
         if out is None:
-            out = tensor_like(a)
-        self.a = wrap_gpu(a)
-        self.b = wrap_gpu(b)
-        self.out = wrap_gpu(out, 'out')
+            out = vk.tensor_like(a)
+        self.a = vk.wrap_gpu(a)
+        self.b = vk.wrap_gpu(b)
+        self.out = vk.wrap_gpu(out, 'out')
         return (a.numel(), 1, 1)
 
     def result(self) -> torch.Tensor:
@@ -108,11 +107,11 @@ class _dummy_function(FunctionBase):
         return self.out.obj
 
 
-def dummy_function(a: torch.Tensor, b: torch.Tensor, alpha: float = 1.0, out: Optional[torch.Tensor] = None):
+def dummy_function(a: torch.Tensor, b: torch.Tensor, alpha: float = 1.0, out: typing.Optional[torch.Tensor] = None):
     return _dummy_function.eval(a, b, alpha = alpha, out = out)
 
 
-class _random_ids(FunctionBase):
+class _random_ids(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + '/tools/random_ids.comp.glsl',
         parameters = dict(
@@ -123,11 +122,11 @@ class _random_ids(FunctionBase):
         )
     )
 
-    def bind(self, N: int, shape: Tuple[int], out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, N: int, shape: typing.Tuple[int], out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         if out is None:
-            out = tensor(N, len(shape), dtype=torch.long)
+            out = vk.tensor(N, len(shape), dtype=torch.long)
             # out = torch.zeros(N, len(shape), dtype=torch.long)
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(shape)
         for i in range(self.dim):
             self.shape[i] = shape[i]
@@ -139,11 +138,11 @@ class _random_ids(FunctionBase):
         return self.out_tensor.obj
 
 
-def random_ids(N: int, shape: Tuple[int], out: Optional[torch.Tensor] = None):
+def random_ids(N: int, shape: typing.Tuple[int], out: typing.Optional[torch.Tensor] = None):
     return _random_ids.eval(N, shape, out = out)
 
 
-class _gridtoimg(FunctionBase):
+class _gridtoimg(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/gridtoimg.comp.glsl",
         parameters = dict(
@@ -155,14 +154,14 @@ class _gridtoimg(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         out_shape = tuple(d - 1 for d in in_tensor.shape[:-1]) + (in_tensor.shape[-1],)
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -177,7 +176,7 @@ class _gridtoimg(FunctionBase):
         return self.out_tensor.obj
 
 
-class _imgtogrid(FunctionBase):
+class _imgtogrid(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/imgtogrid.comp.glsl",
         parameters = dict(
@@ -189,14 +188,14 @@ class _imgtogrid(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         out_shape = tuple(d + 1 for d in in_tensor.shape[:-1]) + (in_tensor.shape[-1],)
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -237,20 +236,20 @@ class _Image2GridFunction(torch.autograd.Function):
         return _gridtoimg.eval(out_grad)
 
 
-def gridtoimg(in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None):
+def gridtoimg(in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None):
     if out is not None:
         assert not in_tensor.requires_grad
         return _gridtoimg.eval(in_tensor, out = out)
     return _Grid2ImageFunction.apply(in_tensor)
 
 
-def imgtogrid(in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None):
+def imgtogrid(in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None):
     if out is not None:
         return _imgtogrid.eval(in_tensor, out = out)
     return _Image2GridFunction.apply(in_tensor)
 
 
-class _resample_grid(FunctionBase):
+class _resample_grid(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/resample_grid.comp.glsl",
         parameters=dict(
@@ -263,15 +262,15 @@ class _resample_grid(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, dst_shape: Tuple[int], out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, dst_shape: typing.Tuple[int], out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         assert len(in_tensor.shape) == len(dst_shape) + 1
         out_shape = dst_shape + (in_tensor.shape[-1],)
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -287,7 +286,7 @@ class _resample_grid(FunctionBase):
         return self.out_tensor.obj
 
 
-def resample_grid(in_tensor: torch.Tensor, dst_shape: Tuple[int,...], out: Optional[torch.Tensor] = None):
+def resample_grid(in_tensor: torch.Tensor, dst_shape: typing.Tuple[int,...], out: typing.Optional[torch.Tensor] = None):
     dst_shape = tuple(dst_shape)
     min_shape = tuple((d + 1)//2 for d in in_tensor.shape[:-1])
     max_shape = tuple(d*2 for d in in_tensor.shape[:-1])
@@ -298,7 +297,7 @@ def resample_grid(in_tensor: torch.Tensor, dst_shape: Tuple[int,...], out: Optio
     return resample_grid(g, dst_shape, out=out)
 
 
-class _resample_img(FunctionBase):
+class _resample_img(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/resample_img.comp.glsl",
         parameters=dict(
@@ -311,15 +310,15 @@ class _resample_img(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, dst_shape: Tuple[int], out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, dst_shape: typing.Tuple[int], out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         assert len(in_tensor.shape) == len(dst_shape) + 1
         out_shape = dst_shape + (in_tensor.shape[-1],)
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape) - 1
         self.output_dim = out_shape[-1]
         elements = 1
@@ -335,7 +334,7 @@ class _resample_img(FunctionBase):
         return self.out_tensor.obj
 
 
-def resample_img(in_tensor: torch.Tensor, dst_shape: Tuple[int,...], out: Optional[torch.Tensor] = None):
+def resample_img(in_tensor: torch.Tensor, dst_shape: typing.Tuple[int,...], out: typing.Optional[torch.Tensor] = None):
     dst_shape = tuple(dst_shape)
     min_shape = tuple((d + 1)//2 for d in in_tensor.shape[:-1])
     max_shape = tuple(d*2 for d in in_tensor.shape[:-1])
@@ -350,7 +349,7 @@ def _power_of_two(x):
     return (x and (not (x & (x - 1))))
 
 
-class _total_variation(FunctionBase):
+class _total_variation(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + '/regularizers/total_variation.comp.glsl',
         parameters= dict(
@@ -361,15 +360,15 @@ class _total_variation(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         assert len(in_tensor.shape) <= 4
         out_shape = in_tensor.shape[:-1] + (1,)
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape)-1
         for i in range(self.dim + 1):
             self.shape[i] = in_tensor.shape[i]
@@ -381,7 +380,7 @@ class _total_variation(FunctionBase):
         return self.out_tensor.obj
 
 
-class _total_variation_backward(FunctionBase):
+class _total_variation_backward(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + '/regularizers/total_variation_backward.comp.glsl',
         parameters=dict(
@@ -393,16 +392,16 @@ class _total_variation_backward(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out_grad_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out_grad_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         assert len(in_tensor.shape) <= 4
         out_shape = in_tensor.shape
         if out is None:
-            out = torch.zeros(*out_shape, dtype=torch.float, device=device())
+            out = torch.zeros(*out_shape, dtype=torch.float, device=_internal.device())
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_grad_tensor = wrap_gpu(out_grad_tensor, 'in')
-        self.in_grad_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_grad_tensor = vk.wrap_gpu(out_grad_tensor, 'in')
+        self.in_grad_tensor = vk.wrap_gpu(out, 'out')
         self.dim = len(out_shape)-1
         for i in range(self.dim + 1):
             self.shape[i] = in_tensor.shape[i]
@@ -432,7 +431,7 @@ def total_variation(in_tensor: torch.Tensor) -> torch.Tensor:
     return _total_variation_diff.apply(in_tensor)
 
 
-class _copy_img_to_morton(FunctionBase):
+class _copy_img_to_morton(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/copy_img_to_morton.comp.glsl",
         parameters = dict(
@@ -443,18 +442,18 @@ class _copy_img_to_morton(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         assert len(in_tensor.shape) == 3, 'in_tensor should be image (HxWxC)'
         assert in_tensor.shape[0] == in_tensor.shape[1], 'in_tensor should be square'
         resolution = in_tensor.shape[0]
         assert _power_of_two(resolution), 'in_tensor size should be power of two'
         out_shape = (resolution*resolution, in_tensor.shape[-1])
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.resolution = resolution
         self.output_dim = out_shape[-1]
         return (resolution*resolution, 1, 1)
@@ -465,11 +464,11 @@ class _copy_img_to_morton(FunctionBase):
         return self.out_tensor.obj
 
 
-def copy_img_to_morton(in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def copy_img_to_morton(in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
     return _copy_img_to_morton.eval(in_tensor, out = out)
 
 
-class _copy_morton_to_img(FunctionBase):
+class _copy_morton_to_img(_internal.FunctionBase):
     __extension_info__ = dict(
         path=__FUNCTIONS_FOLDER__ + "/tools/copy_morton_to_img.comp.glsl",
         parameters = dict(
@@ -480,7 +479,7 @@ class _copy_morton_to_img(FunctionBase):
         )
     )
 
-    def bind(self, in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> Tuple:
+    def bind(self, in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> typing.Tuple:
         import math
         assert len(in_tensor.shape) == 2
         resolution = int(math.sqrt(in_tensor.shape[0]))
@@ -488,11 +487,11 @@ class _copy_morton_to_img(FunctionBase):
         out_shape = (resolution, resolution, in_tensor.shape[-1])
         assert _power_of_two(resolution), 'resolution implicit in in_tensor should be power of two'
         if out is None:
-            out = tensor(*out_shape, dtype=torch.float)
+            out = vk.tensor(*out_shape, dtype=torch.float)
         else:
             assert out.shape == out_shape
-        self.in_tensor = wrap_gpu(in_tensor, 'in')
-        self.out_tensor = wrap_gpu(out, 'out')
+        self.in_tensor = vk.wrap_gpu(in_tensor, 'in')
+        self.out_tensor = vk.wrap_gpu(out, 'out')
         self.resolution = resolution
         self.output_dim = out_shape[-1]
         return (resolution*resolution, 1, 1)
@@ -503,7 +502,7 @@ class _copy_morton_to_img(FunctionBase):
         return self.out_tensor.obj
 
 
-def copy_morton_to_img(in_tensor: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def copy_morton_to_img(in_tensor: torch.Tensor, out: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
     return _copy_morton_to_img.eval(in_tensor, out = out)
 
 
@@ -522,7 +521,7 @@ def create_density_quadtree(densities: torch.Tensor) -> torch.Tensor:
     offsets = [0]
     for s in sizes:
         offsets.append(offsets[-1] + s)
-    pdfs = torch.zeros(offsets[-1], 1, device=device())
+    pdfs = torch.zeros(offsets[-1], 1, device=_internal.device())
     offsets = offsets[:-1]
     offsets.reverse()
     for o in offsets:
@@ -531,13 +530,13 @@ def create_density_quadtree(densities: torch.Tensor) -> torch.Tensor:
     return pdfs
 
 
-def model_to_tensor(model, shape: Tuple[int, int, int], bmin: vec3, bmax: vec3):
+def model_to_tensor(model, shape: typing.Tuple[int, int, int], bmin: vk.vec3, bmax: vk.vec3) -> torch.Tensor:
     dx = (bmax[0] - bmin[0]).item()/(shape[2] - 1)
     dy = (bmax[1] - bmin[1]).item()/(shape[1] - 1)
     dz = (bmax[2] - bmin[2]).item()/(shape[0] - 1)
-    xs = torch.arange(bmin[0].item(), bmax[0].item() + 0.0000001, dx, device=device())
-    ys = torch.arange(bmin[1].item(), bmax[1].item() + 0.0000001, dy, device=device())
-    zs = torch.arange(bmin[2].item(), bmax[2].item() + 0.0000001, dz, device=device())
+    xs = torch.arange(bmin[0].item(), bmax[0].item() + 0.0000001, dx, device=_internal.device())
+    ys = torch.arange(bmin[1].item(), bmax[1].item() + 0.0000001, dy, device=_internal.device())
+    zs = torch.arange(bmin[2].item(), bmax[2].item() + 0.0000001, dz, device=_internal.device())
     points = torch.cartesian_prod(zs, ys, xs)[:, [2, 1, 0]]
     values = model(points)
     return values.view(*shape, -1)
@@ -624,3 +623,9 @@ def generate_perlin_noise_3d(shape, res):
     n1 = (1-t[:,:,:,1])*n01 + t[:,:,:,1]*n11
     np.random.seed(random.randint(0, 1<<31))
     return torch.from_numpy((1-t[:,:,:,2])*n0 + t[:,:,:,2]*n1).float()
+
+
+
+
+
+
